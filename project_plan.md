@@ -20,7 +20,7 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Sweep-all harvest model:** harvest processes all VELO currently held by the vault (`balanceOf`), not just newly claimed rewards. Previously accumulated VELO from no-debt skips is included.
 - **Protocol fee:** configurable by factory admin (e.g. 0.5-2%), paid in VELO before swap
 - **Slippage:** user-configurable per vault, default 0.5% (50 bps). Note: slippage protects against normal price movement but does NOT prevent sandwich/MEV attacks on `getAmountsOut`, which reads spot price manipulable in the same block. See Milestone 3.2 security considerations for details.
-- **No-debt / all-earmarked edge case:** if user has no Alchemix debt, or all debt is earmarked (`earmarked >= debt`), VELO rewards are claimed but NOT swapped; held in vault until repayable debt exists or user recovers them via `rescueToken()`
+- **No-debt / all-earmarked / preexisting alAsset edge cases:** if user has no Alchemix debt, or all debt is earmarked (`earmarked >= debt`), VELO rewards are claimed but NOT swapped; held in vault until repayable debt exists or user recovers them via `rescueToken()`. Additionally, if preexisting alAsset in the vault (from prior failed/partial burns) already covers unearmarked debt, the VELO-to-alAsset swap is skipped (saving swap fees/slippage) and the preexisting alAsset is burned directly.
 - **Emergency withdraw:** unstakes and returns only gauge-withdrawn LP tokens immediately, skipping harvest; any directly donated LP tokens remain in the vault for `rescueToken()`
 - **Vault ownership transfer:** two-step transfer (`transferOwnership` + `acceptOwnership`), mirroring Ownable2Step pattern
 - **Rescue function:** owner can rescue any ERC-20 sent to the vault except actively staked LP principal
@@ -77,11 +77,13 @@ classDiagram
         +ChainConfig chainConfig
         +uint256 protocolFeeBps
         +uint256 callerRewardBps
+        +uint256 minimumHarvestVelo
         +address treasury
         +bool paused
         +createVault() address
         +setImplementation(address)
         +setProtocolFee(uint256)
+        +setMinimumHarvestVelo(uint256)
         +setTreasury(address)
         +setChainConfig(ChainConfig)
         +pause() / unpause()
@@ -262,7 +264,8 @@ library DataTypes {
     uint256 constant MAX_PROTOCOL_FEE_BPS = 500; // 5% max
     uint256 constant MAX_CALLER_REWARD_BPS = 200; // 2% max
     uint256 constant MAX_TOTAL_FEE_BPS = 500;    // 5% combined max (protocolFee + callerReward)
-    uint256 constant MINIMUM_HARVEST_VELO = 1e15; // ~0.001 VELO — below this, swap will likely fail or cost more in gas than it yields
+    uint256 constant DEFAULT_MINIMUM_HARVEST_VELO = 1e15; // ~0.001 VELO — default threshold calibrated for Optimism gas costs
+    uint256 constant MAX_MINIMUM_HARVEST_VELO = 1e18;    // 1 VELO — upper bound prevents admin from setting an unreasonably high threshold that blocks all harvests
     uint256 constant MAX_ROUTE_LENGTH = 5;        // maximum swap route hops — prevents excessive gas and block gas limit issues
 }
 ```
@@ -348,6 +351,7 @@ interface IVeloHarvestFactory {
     function getChainConfig() external view returns (DataTypes.ChainConfig memory);
     function getProtocolFeeBps() external view returns (uint256);
     function getCallerRewardBps() external view returns (uint256);
+    function getMinimumHarvestVelo() external view returns (uint256);
     function getTreasury() external view returns (address);
     function paused() external view returns (bool);
 
@@ -369,6 +373,7 @@ interface IVeloHarvestFactory {
     function setChainConfig(DataTypes.ChainConfig calldata newConfig) external;
     function setProtocolFee(uint256 newFeeBps) external;
     function setCallerReward(uint256 newRewardBps) external;
+    function setMinimumHarvestVelo(uint256 newMin) external;
     function setTreasury(address newTreasury) external;
     function pause() external;
     function unpause() external;
@@ -436,6 +441,7 @@ interface IVeloHarvestVault {
   - `ChainConfigUpdated(address oldRouter, address newRouter, address oldAlETHAlchemist, address newAlETHAlchemist, address oldAlUSDAlchemist, address newAlUSDAlchemist)` -- emits the security-critical address fields that affect vault harvest behavior. Monitors can see exactly which addresses changed without querying storage.
   - `ProtocolFeeUpdated(uint256 oldFee, uint256 newFee)`
   - `CallerRewardUpdated(uint256 oldReward, uint256 newReward)`
+  - `MinimumHarvestVeloUpdated(uint256 oldMin, uint256 newMin)`
   - `TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury)`
 
 **Vault events:**
@@ -473,6 +479,7 @@ error CannotRescueActiveLp(address lpToken);
 error VaultPaused();
 error OnlySelf();
 error InvalidPositionId();
+error MinimumHarvestVeloTooHigh();
 ```
 
 - [ ] Document pause semantics matrix:
@@ -506,6 +513,8 @@ Rationale: only state-expanding operations (new vaults, new deposits, reward pro
 This is consistent: the vault owner always receives the caller reward when they trigger harvest, and third-party keepers receive it when calling the public `harvest()` function.
 
 **Permissionless harvest:** `harvest()` is callable by any address (no access restriction). The caller reward policy is identical regardless of whether the caller is the vault owner or a third-party keeper -- `_harvest(msg.sender)` is always used, and `msg.sender` receives the reward. There is no special-casing for owner vs. non-owner callers.
+
+**Admin operations note (combined fee cap):** Because `protocolFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` is enforced in both `setProtocolFee()` and `setCallerReward()`, an admin must lower one fee before raising the other if the current combined total is at the cap. For example, if `protocolFeeBps = 500` (its individual maximum), any non-zero `callerRewardBps` will revert because `500 + n > 500`. The admin must first lower `protocolFeeBps`, then set `callerRewardBps`. This is by design (prevents accidental over-taxation) but should be documented in the admin operations guide to avoid wasted transactions.
 
 - [ ] Document sweep-all policy:
 
@@ -666,7 +675,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 
 - [ ] Implement `deposit(address lpToken, uint256 amount) external onlyOwner nonReentrant whenNotPaused`:
   1. Validate `amount > 0` (revert `ZeroAmount()`)
-  2. Capture new-LP flag: `bool isNew = deposits[lpToken] == 0;` — **this MUST be captured before the `+=` increment in step 11. Checking `deposits[lpToken] == 0` after the increment would always be false, causing `activeLpTokens` to never be updated.**
+  2. Capture new-LP flag: `bool isNew = deposits[lpToken] == 0;` — **this MUST be captured before the `+=` increment in step 13. Checking `deposits[lpToken] == 0` after the increment would always be false, causing `activeLpTokens` to never be updated.**
   3. Validate `if (isNew) require(activeLpTokens.length < MAX_LP_TOKENS, MaxLpTokensReached(MAX_LP_TOKENS))` — only check the cap when adding a new LP token, not when re-depositing an existing one
   4. Cache chain config: `DataTypes.ChainConfig memory config = factory.getChainConfig()`
   5. Look up gauge: `address gauge = IVoter(config.voter).gauges(lpToken)`
@@ -676,9 +685,10 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
   9. Transfer LP tokens from owner to vault: `IERC20(lpToken).safeTransferFrom(msg.sender, address(this), amount)`
   10. Approve gauge to spend LP tokens: `IERC20(lpToken).forceApprove(gauge, amount)`
   11. Stake in gauge: `IGauge(gauge).deposit(amount)`
-  12. Update state: `deposits[lpToken] += amount`
-  13. If `isNew`: push to `activeLpTokens`, set `lpToGauge[lpToken] = gauge` — only push on first deposit for this LP token; re-deposits must NOT push again
-  14. Emit `Deposited(lpToken, amount)`
+  12. Zero residual gauge approval: `IERC20(lpToken).forceApprove(gauge, 0)` — defensive consistency with the router and alchemist approval-zeroing pattern
+  13. Update state: `deposits[lpToken] += amount`
+  14. Update gauge tracking: `lpToGauge[lpToken] = gauge` — always update, not just on first deposit. If `isNew`: also push to `activeLpTokens`. Re-deposits must NOT push to `activeLpTokens` again. Updating `lpToGauge` on every deposit ensures gauge tracking stays current if Velodrome migrates a gauge for an LP pool (new gauge address for the same pool). For unchanged gauges, this is a no-op storage write.
+  15. Emit `Deposited(lpToken, amount)`
 
   **Note:** This implementation assumes no fee-on-transfer. `deposits[lpToken] += amount` uses the requested amount directly. Fee-on-transfer LP tokens are explicitly unsupported (see Milestone 0.4).
 
@@ -764,6 +774,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 - [ ] Deposit: transfers LP tokens, stakes in gauge, updates state
 - [ ] Deposit multiple LP tokens: state tracks each independently
 - [ ] Deposit exceeding MAX_LP_TOKENS reverts
+- [ ] Re-deposit with changed gauge address: mock voter returns new gauge for same LP token; verify `lpToGauge[lpToken]` is updated to the new gauge; verify new tokens are staked in new gauge
 - [ ] Deposit with invalid/no gauge reverts
 - [ ] Withdraw: unstakes, transfers to owner, updates state
 - [ ] Withdraw more than deposited reverts
@@ -803,6 +814,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
     - `DataTypes.ChainConfig public chainConfig` — chain-specific addresses
     - `uint256 public protocolFeeBps` — protocol fee (default e.g. 100 = 1%)
     - `uint256 public callerRewardBps` — harvest caller reward (default 50 = 0.5%)
+    - `uint256 public minimumHarvestVelo` — minimum VELO balance required for harvest to proceed (below this, harvest skips to avoid micro-swap gas waste). Default `DEFAULT_MINIMUM_HARVEST_VELO` (1e15, ~0.001 VELO). Calibrated for Optimism gas costs; should be adjusted per deployment for chains with different gas economics.
     - `address public treasury` — protocol fee recipient
     - `mapping(address user => address[] vaults) public userVaults` — user's vaults
     - `address[] public allVaults` — registry of all deployed vaults
@@ -813,6 +825,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
         DataTypes.ChainConfig memory _chainConfig,
         uint256 _protocolFeeBps,
         uint256 _callerRewardBps,
+        uint256 _minimumHarvestVelo,
         address _treasury
     )
     ```
@@ -834,6 +847,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
     - Validate `_implementation != address(0)`
     - Validate `_treasury != address(0)`
     - Validate fee BPS within bounds: individual caps (`_protocolFeeBps <= MAX_PROTOCOL_FEE_BPS`, `_callerRewardBps <= MAX_CALLER_REWARD_BPS`) and combined cap (`_protocolFeeBps + _callerRewardBps <= MAX_TOTAL_FEE_BPS`)
+    - Validate `_minimumHarvestVelo <= MAX_MINIMUM_HARVEST_VELO` (revert `MinimumHarvestVeloTooHigh()`)
     - Initialize ownership to deployer using the OZ ownership constructor pattern required by the installed version (e.g., `Ownable(msg.sender)` for OZ v5)
 
   - **`createVault()` function:**
@@ -857,6 +871,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
     - `setChainConfig(DataTypes.ChainConfig calldata newConfig)` — update chain addresses (e.g. when Alchemix v3 deploys). Applies the same address validation rules as the constructor (see ChainConfig validation table above). Emits `ChainConfigUpdated(oldConfig.router, newConfig.router, oldConfig.alETHAlchemist, newConfig.alETHAlchemist, oldConfig.alUSDAlchemist, newConfig.alUSDAlchemist)` with the security-critical fields that affect vault behavior.
     - `setProtocolFee(uint256 newFeeBps)` — validate `newFeeBps <= MAX_PROTOCOL_FEE_BPS` AND `newFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `ProtocolFeeUpdated(oldFee, newFee)`.
     - `setCallerReward(uint256 newRewardBps)` — validate `newRewardBps <= MAX_CALLER_REWARD_BPS` AND `protocolFeeBps + newRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `CallerRewardUpdated(oldReward, newReward)`.
+    - `setMinimumHarvestVelo(uint256 newMin)` — validate `newMin <= MAX_MINIMUM_HARVEST_VELO` (revert `MinimumHarvestVeloTooHigh()`). Emits `MinimumHarvestVeloUpdated(oldMin, newMin)`. This allows per-deployment tuning of the harvest dust threshold for chains with different gas economics.
     - `setTreasury(address newTreasury)` — validate non-zero (revert `ZeroAddress()`). Emits `TreasuryUpdated(oldTreasury, newTreasury)`.
     - `pause()` / `unpause()` — global pause toggle (inherited from OZ `Pausable`)
 
@@ -945,7 +960,7 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   2. Get total VELO balance (sweep-all model): `uint256 veloBalance = IERC20(config.veloToken).balanceOf(address(this))`
 
      This captures the vault's entire VELO balance, including any previously accumulated VELO from earlier no-debt/skip scenarios. This is the intended "sweep-all" model (see Milestone 0.4). Users who want to extract accumulated VELO before it gets processed should call `rescueToken(veloToken, amount)` first. This balance check runs even when there are no active LPs, ensuring previously accumulated VELO gets processed.
-  3. If `veloBalance < MINIMUM_HARVEST_VELO`, emit `HarvestSkipped(veloBalance, "below minimum")` and return 0. This covers both the zero-VELO case (providing observability for a previously silent path) and the micro-balance case (preventing router reverts from tiny swap amounts).
+  3. If `veloBalance < factory.getMinimumHarvestVelo()`, emit `HarvestSkipped(veloBalance, "below minimum")` and return 0. This covers both the zero-VELO case (providing observability for a previously silent path) and the micro-balance case (preventing router reverts from tiny swap amounts). The threshold is a factory-configurable parameter (default `DEFAULT_MINIMUM_HARVEST_VELO = 1e15`, ~0.001 VELO) to allow per-deployment tuning for chains with different gas economics.
   4. Read fee config from factory: `uint256 callerRewardBps = factory.getCallerRewardBps()`
   5. Read fee config from factory: `uint256 protocolFeeBps = factory.getProtocolFeeBps()`
   6. Calculate caller reward: `uint256 callerReward = (veloBalance * callerRewardBps) / MAX_BPS`
@@ -990,7 +1005,9 @@ This ensures consistent behavior: the vault owner always receives the caller rew
 **Testing (unit)**
 
 - [ ] Harvest with no active LPs and no VELO returns 0, emits `HarvestSkipped(0, "below minimum")`
-- [ ] Harvest with VELO below `MINIMUM_HARVEST_VELO` returns 0, emits `HarvestSkipped(veloBalance, "below minimum")`
+- [ ] Harvest with VELO below `factory.getMinimumHarvestVelo()` returns 0, emits `HarvestSkipped(veloBalance, "below minimum")`
+- [ ] Admin can update `minimumHarvestVelo` via `setMinimumHarvestVelo()`; harvest respects updated threshold
+- [ ] `setMinimumHarvestVelo` reverts when `newMin > MAX_MINIMUM_HARVEST_VELO`
 - [ ] Harvest with no active LPs but VELO in vault: sweep-all processes accumulated VELO
 - [ ] Harvest claims from all active (alive) gauges
 - [ ] Dead gauge is skipped during harvest (no revert, `GaugeSkipped` event emitted with "gauge not alive")
@@ -1035,9 +1052,13 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
          emit HarvestSkipped(veloAmount, "alchemist not set");
          return;
      }
+     uint256 debt;
+     uint256 earmarked;
      try IAlchemistV3(alchemist).getCDP(alchemixPositionId) returns (
-         uint256 debt, uint256 earmarked, uint256
+         uint256 _debt, uint256 _earmarked, uint256
      ) {
+         debt = _debt;
+         earmarked = _earmarked;
          if (debt == 0 || earmarked >= debt) {
              emit HarvestSkipped(veloAmount, debt == 0 ? "no debt" : "all debt earmarked");
              return;
@@ -1047,6 +1068,7 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
          return;
      }
      ```
+     `debt` and `earmarked` are declared outside the `try` block so they remain accessible in step 5 for the swap-skip optimization.
   4. **Verify debt token matches configured alAsset (prevents admin misconfiguration):**
      ```solidity
      address alAssetToken = alAssetType == AlAssetType.alETH ? config.alETH : config.alUSD;
@@ -1061,29 +1083,42 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
      }
      ```
      This prevents scenarios where the factory admin sets the wrong alchemist for the vault's alAsset type. The check is cheap and prevents wasted swaps.
-  5. **Swap VELO to alAsset (with before/after balance measurement):**
+  5. **Check preexisting alAsset against unearmarked debt (swap-skip optimization):**
      ```solidity
-     address router = config.router;
-     address veloToken = config.veloToken;
-
-     uint256[] memory amountsOut = IRouter(router).getAmountsOut(veloAmount, _swapRoute);
-     uint256 expectedOut = amountsOut[amountsOut.length - 1];
-     uint256 minOut = (expectedOut * (MAX_BPS - slippageBps)) / MAX_BPS;
-
+     uint256 unearmarkedDebt = debt - earmarked;
      uint256 balanceBeforeSwap = IERC20(alAssetToken).balanceOf(address(this));
-
-     IERC20(veloToken).forceApprove(router, veloAmount);
-
-     IRouter(router).swapExactTokensForTokens(
-         veloAmount, minOut, _swapRoute, address(this), block.timestamp
-     );
-
-     IERC20(veloToken).forceApprove(router, 0); // zero residual router approval for defensive consistency
-
-     uint256 balanceAfterSwap = IERC20(alAssetToken).balanceOf(address(this));
-     uint256 newlyReceived = balanceAfterSwap - balanceBeforeSwap;
      ```
-  6. **Burn alAsset for debt repayment (total-balance burn):**
+     If `balanceBeforeSwap >= unearmarkedDebt`, preexisting alAsset from prior failed/partial burns already covers the repayable debt. Skip the swap entirely (no VELO wasted on swap fees/slippage) and proceed directly to burn (step 7). VELO remains in the vault as an ERC-20 balance, recoverable via `rescueToken()` or processable on a future harvest when more debt appears. Emit `HarvestSkipped(veloAmount, "preexisting alAsset covers debt")` is NOT emitted here because the burn still proceeds — only the swap is skipped. The event `SwappedAndBurned` will have `newlyReceived = 0` in this case, which provides observability.
+  6. **Swap VELO to alAsset (conditional — skipped if preexisting alAsset covers debt):**
+     ```solidity
+     uint256 balanceAfterSwap;
+     uint256 newlyReceived;
+
+     if (balanceBeforeSwap >= unearmarkedDebt) {
+         // Preexisting alAsset covers all unearmarked debt — skip swap
+         balanceAfterSwap = balanceBeforeSwap;
+         newlyReceived = 0;
+     } else {
+         address router = config.router;
+         address veloToken = config.veloToken;
+
+         uint256[] memory amountsOut = IRouter(router).getAmountsOut(veloAmount, _swapRoute);
+         uint256 expectedOut = amountsOut[amountsOut.length - 1];
+         uint256 minOut = (expectedOut * (MAX_BPS - slippageBps)) / MAX_BPS;
+
+         IERC20(veloToken).forceApprove(router, veloAmount);
+
+         IRouter(router).swapExactTokensForTokens(
+             veloAmount, minOut, _swapRoute, address(this), block.timestamp
+         );
+
+         IERC20(veloToken).forceApprove(router, 0);
+
+         balanceAfterSwap = IERC20(alAssetToken).balanceOf(address(this));
+         newlyReceived = balanceAfterSwap - balanceBeforeSwap;
+     }
+     ```
+  7. **Burn alAsset for debt repayment (total-balance burn):**
      ```solidity
      IERC20(alAssetToken).forceApprove(alchemist, balanceAfterSwap);
 
@@ -1099,17 +1134,18 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
      ```
 
      Key points:
-     - **Three balance measurements** track the full lifecycle:
+     - **Swap-skip optimization:** Before swapping, the vault computes `unearmarkedDebt = debt - earmarked` and compares against `balanceBeforeSwap` (preexisting alAsset from prior failed/partial burns or manual transfers). If the preexisting balance already covers unearmarked debt, the VELO-to-alAsset swap is skipped entirely, avoiding wasted swap fees and slippage. VELO remains in the vault, recoverable via `rescueToken()` or processable on future harvests when more debt appears. The burn still proceeds using the preexisting alAsset. When the swap is skipped, `newlyReceived = 0` in the `SwappedAndBurned` event provides observability.
+     - **Three balance measurements** track the full lifecycle (when swap occurs):
        - `balanceBeforeSwap` — vault's alAsset balance before the swap (may include preexisting alAsset from prior failed/partial burns or manual transfers)
-       - `balanceAfterSwap` — vault's total alAsset balance after the swap (new + preexisting)
+       - `balanceAfterSwap` — vault's total alAsset balance after the swap (new + preexisting), or equal to `balanceBeforeSwap` if swap was skipped
        - `balanceAfterBurn` — vault's alAsset balance after burn
-     - `newlyReceived = balanceAfterSwap - balanceBeforeSwap` — amount received from this swap only (used in event for observability)
+     - `newlyReceived = balanceAfterSwap - balanceBeforeSwap` — amount received from this swap only (0 if swap skipped; used in event for observability)
      - `actualBurned = balanceAfterSwap - balanceAfterBurn` — what Alchemix actually consumed (may be less than `balanceAfterSwap` if amount exceeds unearmarked debt; may be greater than `newlyReceived` if preexisting alAsset was also burned)
      - **Burn uses total vault alAsset balance (`balanceAfterSwap`), not just `newlyReceived`.** This ensures accumulated alAsset from prior partial burns or failed burns is included in the burn attempt, rather than sitting idle until manually rescued. Remaining alAsset after burn (if any) is still recoverable via `rescueToken()`.
      - Zero residual approval after burn (whether success or failure) using `forceApprove(alchemist, 0)`
      - `try/catch` handles `BurnLimitExceeded` or other reverts gracefully; alAsset stays in vault
 
-**Note:** There are no dedicated `withdrawVelo()` or `withdrawAlAsset()` functions. Accumulated VELO (from no-debt skips) is extracted via `rescueToken()`. Accumulated alAsset is automatically included in the next burn attempt; any remainder after burn is recoverable via `rescueToken()`. See Milestone 0.4 rescue policy.
+**Note:** There are no dedicated `withdrawVelo()` or `withdrawAlAsset()` functions. Accumulated VELO (from no-debt skips or swap-skip optimizations) is extracted via `rescueToken()`. Accumulated alAsset is automatically included in the next burn attempt; any remainder after burn is recoverable via `rescueToken()`. See Milestone 0.4 rescue policy.
 
 **Swap route configuration notes:**
 
@@ -1130,6 +1166,8 @@ The exact route depends on available liquidity pools at deployment time. The own
 - `block.timestamp` as deadline (immediate execution) — acceptable since the harvest is triggered by a user/keeper and MEV protection is via slippage
 - If swap reverts (slippage exceeded), the entire harvest reverts — all state changes in that call frame are rolled back, including the gauge `getReward()` claims that occurred earlier in the same call. Rewards return to their claimable state in the gauges. Nothing is lost; the rewards will be re-claimed and processed on the next successful harvest. (Note: any pre-existing VELO balance in the vault from prior no-debt skips is unaffected by the revert and remains in the vault.)
 - Accumulated alAssets/VELO in vault are only extractable by owner (via `rescueToken()`)
+- **Swap-skip optimization:** When preexisting alAsset in the vault (from prior failed/partial burns) already covers the position's unearmarked debt, the VELO-to-alAsset swap is skipped entirely. This avoids wasting swap fees and slippage on alAsset that cannot be consumed, and reduces MEV exposure by eliminating unnecessary swaps. VELO remains in the vault for future harvests or owner extraction via `rescueToken()`.
+- VELO balance consistency during swap is guaranteed by the `nonReentrant` guard on all entry points (`harvest()`, `deposit()`, `withdraw()`). A balance change between `forceApprove(router, veloAmount)` and `swapExactTokensForTokens(veloAmount, ...)` is impossible in practice because no reentrant path can alter the vault's VELO balance mid-execution.
 
 **Testing (unit with mocks)**
 
@@ -1145,6 +1183,8 @@ The exact route depends on available liquidity pools at deployment time. The own
 - [ ] rescueToken for VELO: owner can retrieve accumulated VELO via `rescueToken(veloToken, amount)`
 - [ ] rescueToken for alAsset: owner can retrieve remaining alAsset (after burn attempts) via `rescueToken(alAssetToken, amount)`
 - [ ] Accumulated alAsset from failed burn is included in next successful burn: vault with preexisting alAsset from prior failed burn; next harvest swaps new VELO and burns total `balanceAfterSwap` (new + preexisting)
+- [ ] **Swap skipped when preexisting alAsset covers unearmarked debt:** vault holds alAsset >= unearmarked debt from prior failed burns; harvest claims VELO but does NOT swap (no router interaction); burns preexisting alAsset against debt; VELO remains in vault; `SwappedAndBurned` event has `newlyReceived = 0`
+- [ ] **Swap proceeds when preexisting alAsset is insufficient:** vault holds some alAsset but less than unearmarked debt; harvest swaps VELO and burns total `balanceAfterSwap`; both preexisting and newly swapped alAsset are consumed
 - [ ] **Route validation with zero alAsset target:** vault creation with zero alAsset address in chain config accepts empty route; `setSwapRoute()` with zero target skips end-token validation (rule 3) but still enforces rules 1, 2, 4 for non-empty routes; once alAsset address is set via `setChainConfig()`, `setSwapRoute()` enforces full validation including end-token check
 
 **Done when**
@@ -1246,9 +1286,11 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
 - [ ] `test/unit/VeloHarvestFactory.t.sol`:
   - **Deployment:** correct initial state
   - **createVault:** deploys functional clone, registers in mappings, multiple vaults per user (unlimited)
-  - **Admin functions:** setImplementation, setChainConfig, setProtocolFee, setCallerReward, setTreasury, pause/unpause
+  - **Admin functions:** setImplementation, setChainConfig, setProtocolFee, setCallerReward, setMinimumHarvestVelo, setTreasury, pause/unpause
   - **Combined fee cap:** `protocolFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` enforced in constructor, `setProtocolFee()`, and `setCallerReward()`; setting one fee to a value that would exceed the combined cap with the other fee reverts
-  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct router/alchemist address fields, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `TreasuryUpdated`)
+  - **Combined fee cap admin ordering:** when `protocolFeeBps` is at `MAX_TOTAL_FEE_BPS`, setting any non-zero `callerRewardBps` reverts; lowering `protocolFeeBps` first, then setting `callerRewardBps` succeeds (verifies the documented admin workflow)
+  - **Minimum harvest threshold:** `setMinimumHarvestVelo` validates `newMin <= MAX_MINIMUM_HARVEST_VELO`; harvest respects current factory value
+  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct router/alchemist address fields, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `MinimumHarvestVeloUpdated`, `TreasuryUpdated`)
   - **Access control:** non-owner reverts
   - **Ownable2Step:** two-step transfer works correctly
   - **Pause:** createVault reverts when paused
@@ -1469,7 +1511,7 @@ Systematic security review and hardening of all contracts before deployment.
 - [ ] **Access control:** Verify `onlyOwner` on all restricted functions. Verify no unprotected state changes. Verify two-step ownership transfer (`transferOwnership` / `acceptOwnership`) is correctly implemented.
 - [ ] **Integer overflow/underflow:** Solidity 0.8+ handles this, but verify no unchecked blocks have issues.
 - [ ] **Token handling:** SafeERC20 everywhere. Handle tokens that don't return bool. Fee-on-transfer LP tokens are explicitly unsupported — verify this assumption is documented and no balance-delta is needed for standard LP tokens.
-- [ ] **Approve patterns:** Verify all approvals use `forceApprove` (OZ v5). Verify all residual approvals are zeroed after use: router approval zeroed after swap, alchemist approval zeroed after burn (both success and failure paths).
+- [ ] **Approve patterns:** Verify all approvals use `forceApprove` (OZ v5). Verify all residual approvals are zeroed after use: gauge approval zeroed after deposit, router approval zeroed after swap, alchemist approval zeroed after burn (both success and failure paths).
 - [ ] **Front-running / MEV:** Swap slippage protection via `minOut` based on `getAmountsOut`. **Known risk:** `getAmountsOut` reads spot price which is manipulable in the same block (sandwich attacks). The `slippageBps` only protects against movement beyond the already-manipulated price. This is documented as a known limitation (see Milestone 3.2). Conservative default slippage (0.5%) is set. Future versions may add an optional `minAmountOut` parameter to `harvest()` for off-chain price calculation. Document this risk in `SECURITY.md`.
 - [ ] **Denial of service:** `activeLpTokens` array is capped at 10. Gauge iteration is bounded. No unbounded loops. `emergencyWithdrawAll` uses while-loop pattern to avoid skipping. Total harvest fees bounded at `MAX_TOTAL_FEE_BPS` (5% combined).
 - [ ] **Proxy storage collisions:** Verify no storage layout issues between implementation and proxy. Implementation uses `_disableInitializers()` in constructor.
@@ -1482,6 +1524,7 @@ Systematic security review and hardening of all contracts before deployment.
   - Route structural validation (hop continuity, start/end tokens) does not guarantee executable liquidity. Pool existence and sufficient liquidity are operational assumptions. Invalid-but-structurally-correct routes fail at swap time; the withdraw try/catch ensures this does not block user exit.
   - **alETH pool existence (Optimism):** alETH Velodrome pools on Optimism may not exist at launch. Verify that a viable VELO -> ... -> alETH swap route exists before deploying alETH vaults. alUSD routes are more certain. If no pool exists, alETH vaults should not be created until one does.
   - **alAsset address change (operational risk):** If admin updates `config.alETH` or `config.alUSD` to a new address (e.g., V3 uses different alAsset than V2), existing vaults with swap routes ending in the old token address will fail at swap time. The `debtToken()` mismatch check catches some cases, but if both `alchemist.debtToken()` and `config.alETH` are updated consistently, the route's `_swapRoute[last].to` still points to the old token. Affected vault owners must manually call `setSwapRoute()` to update their route. This should be prominently documented in `SECURITY.md`, and the `ChainConfigUpdated` event provides sufficient data for tooling to detect and alert affected users.
+  - **Gauge migration (latent risk):** If Velodrome migrates a gauge (creates a new gauge address for the same LP pool while deprecating the old one), `lpToGauge[lpToken]` is updated on the next deposit (step 14 always writes the voter-looked-up gauge). New deposits are staked in the new gauge and tracked correctly. However, prior deposits staked in the old gauge remain there — the vault has no mechanism to migrate staked LP tokens between gauges. Users with deposits in a deprecated gauge should `emergencyWithdraw` those tokens and re-deposit to stake in the new gauge. Gauge migration is rare in practice but this operational procedure should be documented in the user guide.
 
 - [ ] **Withdraw exitability guarantee:** Verify that `withdraw()` never reverts due to harvest path failures. The self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`) must catch all possible revert paths including router failures, alchemist failures, gauge getReward failures, and unexpected external reverts. Verify that `_harvestForWithdraw(address rewardRecipient)` is external (required for try/catch) and NOT nonReentrant (would fail since withdraw already holds the lock). Verify `rewardRecipient` is correctly passed through to `_harvest()`. When factory is paused, verify harvest is skipped entirely within `withdraw()` (no self-call). This is the single most important safety invariant for user asset protection.
 
