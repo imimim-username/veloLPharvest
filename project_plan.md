@@ -21,7 +21,7 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Protocol fee:** configurable by factory admin (e.g. 0.5-2%), paid in VELO before swap
 - **Slippage:** user-configurable per vault, default 0.5% (50 bps)
 - **No-debt edge case:** if user has no Alchemix debt, VELO rewards are claimed but NOT swapped; held in vault until debt exists or user recovers them via `rescueToken()`
-- **Emergency withdraw:** unstakes and returns all LP tokens immediately, skipping harvest
+- **Emergency withdraw:** unstakes and returns only gauge-withdrawn LP tokens immediately, skipping harvest; any directly donated LP tokens remain in the vault for `rescueToken()`
 - **Vault ownership transfer:** two-step transfer (`transferOwnership` + `acceptOwnership`), mirroring Ownable2Step pattern
 - **Rescue function:** owner can rescue any ERC-20 sent to the vault except actively staked LP principal
 - **Admin role:** Ownable2Step with pause capability; admin can update implementation (for future clones), set fees, pause. Transition to pause-only by transferring ownership to a restricted contract later.
@@ -953,7 +953,7 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   - **NOT `nonReentrant`** — `withdraw()` already holds the reentrancy lock; applying `nonReentrant` here would cause the self-call to revert
   - `msg.sender == address(this)` guard — prevents arbitrary external callers from invoking this function. The only legitimate caller is the contract itself via the self-call in `withdraw()`
   - **`rewardRecipient` parameter** — when `withdraw()` does `this._harvestForWithdraw(msg.sender)`, `msg.sender` inside the external call becomes `address(this)` (Solidity external self-call semantics). The `rewardRecipient` parameter passes the original caller's address through so `_harvest()` sends the caller reward to the vault owner, not to the contract itself.
-  - This function is NOT part of the `IVeloHarvestVault` interface. It is an implementation detail, not a public API surface. External tooling should not call it. Despite being excluded from the interface, `_harvestForWithdraw()` must have full NatSpec documentation (purpose, parameters, security rationale, and reentrancy note) for audit readability and internal tooling.
+  - This function is NOT part of the `IVeloHarvestVault` interface. It is an implementation detail, not a public API surface. External tooling should not call it. It is implemented on the concrete `VeloHarvestVault` contract only and is invoked via `this._harvestForWithdraw(...)` from within the implementation; the Solidity `this.` syntax routes through the contract's own external dispatch, which works regardless of interface membership. Despite being excluded from the interface, `_harvestForWithdraw()` must have full NatSpec documentation (purpose, parameters, security rationale, and reentrancy note) for audit readability and internal tooling.
   - `deposit()` does NOT use this wrapper. It calls `_harvest(msg.sender)` directly (internal call). If harvest fails during deposit, the deposit reverts — this is intentional (see "Deposit harvest dependency" in architectural decisions).
 
 **Harvest reward policy:** Caller reward is always paid to `rewardRecipient`, which is:
@@ -1108,7 +1108,7 @@ The exact route depends on available liquidity pools at deployment time. The own
 - `try/catch` around alchemist `burn()` call to prevent harvest from reverting entirely
 - Three-point balance measurement (`balanceBeforeSwap`, `balanceAfterSwap`, `balanceAfterBurn`) isolates newly swapped alAsset from preexisting balance and reports actual burned amount accurately
 - `block.timestamp` as deadline (immediate execution) — acceptable since the harvest is triggered by a user/keeper and MEV protection is via slippage
-- If swap reverts (slippage exceeded), the entire harvest reverts — VELO remains in the vault as an ERC-20 balance (it was already claimed from gauges and transferred to the vault during the gauge-claim loop; the revert only unwinds the swap, not the claim). Nothing is lost; the VELO will be processed on the next successful harvest.
+- If swap reverts (slippage exceeded), the entire harvest reverts — all state changes in that call frame are rolled back, including the gauge `getReward()` claims that occurred earlier in the same call. Rewards return to their claimable state in the gauges. Nothing is lost; the rewards will be re-claimed and processed on the next successful harvest. (Note: any pre-existing VELO balance in the vault from prior no-debt skips is unaffected by the revert and remains in the vault.)
 - Accumulated alAssets/VELO in vault are only extractable by owner (via `rescueToken()`)
 
 **Testing (unit with mocks)**
@@ -1549,7 +1549,7 @@ Comprehensive README and supporting documentation for the project.
   4. Rewards accrue and are harvested automatically: on every deposit (required) and on withdraw when unpaused (best-effort -- withdrawal always succeeds even if harvest fails)
   5. Third parties or bots call `harvest()` to earn the 0.5% VELO reward (permissionless -- reward behavior is identical whether called by the owner or a third party)
   6. User can call `emergencyWithdraw()` at any time
-  7. Owner may recover accumulated VELO or alAsset from the vault via `rescueToken()` at any time; doing so reduces future auto-repayment (see trust model)
+  7. Owner may recover accumulated VELO or alAsset from the vault via `rescueToken()` at any time, including while the factory is paused; doing so reduces future auto-repayment (see trust model)
 
 **Done when**
 
