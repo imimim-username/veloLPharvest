@@ -14,19 +14,19 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Unlimited vaults per user** via EIP-1167 minimal proxy clones (~90% gas savings vs full deploy). Users commonly create one vault per alAsset type or per LP strategy. The factory does not enforce uniqueness.
 - **Multiple LP tokens per vault** (capped at 10 for gas safety during harvest)
 - **One alAsset type per vault** (alETH or alUSD, chosen at vault creation)
-- **Alchemix position NFT ID** set at vault creation, updatable later by owner
+- **Alchemix position NFT ID** set at vault creation (must be > 0; NFT IDs start at 1), updatable later by owner
 - **Harvest triggers:** (a) `deposit()` auto-harvests (reverts if harvest fails); `withdraw()` attempts harvest when unpaused (proceeds regardless of harvest outcome), (b) public `harvest()` with configurable VELO reward to caller (default 0.5%, set via factory `callerRewardBps`)
 - **Harvest reward policy:** caller reward is always paid to `rewardRecipient` (passed to `_harvest()`). For public `harvest()` and `deposit()`, this is `msg.sender`. For `withdraw()`, this is the vault owner's address (passed through the self-call). No special-casing within `_harvest()` itself.
 - **Sweep-all harvest model:** harvest processes all VELO currently held by the vault (`balanceOf`), not just newly claimed rewards. Previously accumulated VELO from no-debt skips is included.
 - **Protocol fee:** configurable by factory admin (e.g. 0.5-2%), paid in VELO before swap
-- **Slippage:** user-configurable per vault, default 0.5% (50 bps)
-- **No-debt edge case:** if user has no Alchemix debt, VELO rewards are claimed but NOT swapped; held in vault until debt exists or user recovers them via `rescueToken()`
+- **Slippage:** user-configurable per vault, default 0.5% (50 bps). Note: slippage protects against normal price movement but does NOT prevent sandwich/MEV attacks on `getAmountsOut`, which reads spot price manipulable in the same block. See Milestone 3.2 security considerations for details.
+- **No-debt / all-earmarked edge case:** if user has no Alchemix debt, or all debt is earmarked (`earmarked >= debt`), VELO rewards are claimed but NOT swapped; held in vault until repayable debt exists or user recovers them via `rescueToken()`
 - **Emergency withdraw:** unstakes and returns only gauge-withdrawn LP tokens immediately, skipping harvest; any directly donated LP tokens remain in the vault for `rescueToken()`
 - **Vault ownership transfer:** two-step transfer (`transferOwnership` + `acceptOwnership`), mirroring Ownable2Step pattern
 - **Rescue function:** owner can rescue any ERC-20 sent to the vault except actively staked LP principal
-- **Admin role:** Ownable2Step with pause capability; admin can update implementation (for future clones), set fees, pause. Transition to pause-only by transferring ownership to a restricted contract later.
+- **Admin role:** Ownable2Step with pause capability; admin can update implementation (for future clones), set fees, pause. All admin config changes (chainConfig, implementation, treasury) take effect immediately with no timelock in v1. A compromised admin could redirect swaps or burn targets. Transition to pause-only or timelock-gated governance by transferring ownership to a restricted contract later.
 - **Fee-on-transfer LP tokens are not supported.** The vault uses `amount` as both the transfer input and the deposited amount. If an LP token charges a transfer fee, internal accounting will be incorrect.
-- **Withdraw harvest resilience (self-call pattern):** `withdraw()` attempts harvest via an external self-call: `try this._harvestForWithdraw(msg.sender) { ... } catch { emit HarvestSkipped(...); }`. The `_harvestForWithdraw(address rewardRecipient)` function is `external` (enabling try/catch, which only works on external calls), NOT `nonReentrant` (because `withdraw()` already holds the reentrancy lock), and guarded by `require(msg.sender == address(this))` to prevent arbitrary external callers. The `rewardRecipient` parameter passes the vault owner's address through to `_harvest()`, because `msg.sender` changes to `address(this)` in Solidity external self-calls. If harvest fails for any reason (broken route, external revert, etc.), the catch block ensures withdrawal proceeds anyway. When paused, `withdraw()` skips harvest entirely (no self-call). `deposit()` calls `_harvest(msg.sender)` directly without resilience -- deposit is intentionally allowed to fail if the harvest path is broken (see "Deposit harvest dependency" below). This guarantees users can always exit regardless of harvest path health.
+- **Withdraw harvest resilience (self-call pattern):** `withdraw()` attempts harvest via an external self-call: `try this._harvestForWithdraw(msg.sender) { ... } catch { emit HarvestFailed(...); }`. The `_harvestForWithdraw(address rewardRecipient)` function is `external` (enabling try/catch, which only works on external calls), NOT `nonReentrant` (because `withdraw()` already holds the reentrancy lock), and guarded by `require(msg.sender == address(this))` to prevent arbitrary external callers. The `rewardRecipient` parameter passes the vault owner's address through to `_harvest()`, because `msg.sender` changes to `address(this)` in Solidity external self-calls. If harvest fails for any reason (broken route, external revert, etc.), the catch block ensures withdrawal proceeds anyway. When paused, `withdraw()` skips harvest entirely (no self-call). `deposit()` calls `_harvest(msg.sender)` directly without resilience -- deposit is intentionally allowed to fail if the harvest path is broken (see "Deposit harvest dependency" below). This guarantees users can always exit regardless of harvest path health.
 - **Deposit harvest dependency:** `deposit()` calls `_harvest(msg.sender)` directly (not via the resilient self-call path). If the harvest path is broken (bad swap route, router failure, etc.), deposits with existing LP positions will revert. This is a conscious design choice: deposits are a non-emergency operation, and the owner can fix the route/config or use `setSwapRoute()` before depositing more. In contrast, `withdraw()` is always resilient.
 - **Gauge compatibility requirement:** supported deployments must use gauge implementations compatible with `IGauge` as defined in this project. Gauges with multiple reward tokens or non-VELO rewards are incompatible and unsupported. This is a deployment prerequisite, not merely an assumption.
 - **Approval strategy:** all token approvals use `forceApprove` (OZ v5) to handle tokens that require approve-to-zero before setting a new allowance. This is the single canonical approval pattern used throughout.
@@ -41,7 +41,7 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 sequenceDiagram
     participant User
     participant Factory as VeloHarvestFactory
-    participant Vault as VeloHarvestVault (Clone)
+    participant Vault as "VeloHarvestVault (Clone)"
     participant Gauge as Velodrome Gauge
     participant Router as Velodrome Router
     participant Alchemist as AlchemistV3
@@ -57,7 +57,7 @@ sequenceDiagram
     Note over Vault: Time passes, VELO accrues
 
     User->>Vault: withdraw(lpToken, amount)
-    Vault->>Vault: this._harvestForWithdraw(msg.sender) [self-call, try/catch; skip if paused]
+    Vault->>Vault: this._harvestForWithdraw(msg.sender) [self-call, try/catch, skip if paused]
     Vault->>Gauge: withdraw(amount)
     Vault->>User: transfer LP tokens
 
@@ -261,6 +261,9 @@ library DataTypes {
     uint256 constant MAX_LP_TOKENS = 10;
     uint256 constant MAX_PROTOCOL_FEE_BPS = 500; // 5% max
     uint256 constant MAX_CALLER_REWARD_BPS = 200; // 2% max
+    uint256 constant MAX_TOTAL_FEE_BPS = 500;    // 5% combined max (protocolFee + callerReward)
+    uint256 constant MINIMUM_HARVEST_VELO = 1e15; // ~0.001 VELO — below this, swap will likely fail or cost more in gas than it yields
+    uint256 constant MAX_ROUTE_LENGTH = 5;        // maximum swap route hops — prevents excessive gas and block gas limit issues
 }
 ```
 
@@ -290,6 +293,8 @@ Define Solidity interfaces for the external contracts this system interacts with
   - `function earned(address account) external view returns (uint256)`
   - `function balanceOf(address account) external view returns (uint256)`
 
+  **Killed gauge withdrawal verification (critical deployment prerequisite):** The spec assumes `IGauge(gauge).withdraw(amount)` succeeds for killed gauges. This MUST be verified against Velodrome's actual killed-gauge implementation before mainnet launch. If killed gauges revert on `withdraw()`, users could be permanently stuck. Both `withdraw()` and `emergencyWithdraw()` call `gauge.withdraw()` — neither has a fallback for a reverting gauge withdrawal. Add to the audit prep checklist.
+
 - [ ] Create `src/interfaces/external/IRouter.sol`:
   - Use the Velodrome V2 Router interface:
   - `struct Route { address from; address to; bool stable; address factory; }`
@@ -308,10 +313,10 @@ Define Solidity interfaces for the external contracts this system interacts with
 **Important Alchemix v3 integration notes (from docs):**
 
 - `burn(amount, recipientId)` burns alAsset tokens **from the caller** (msg.sender) to repay debt on position `recipientId`. Anyone can call this for any position (paying down someone's debt is always allowed). The vault must hold alAsset tokens.
-- `getCDP(tokenId)` returns `(debt, earmarked, collateral)` — use `debt` to check if the user has outstanding debt before swapping.
+- `getCDP(tokenId)` returns `(debt, earmarked, collateral)` — use `debt` and `earmarked` to check if the user has repayable (unearmarked) debt before swapping. The vault explicitly checks `debt == 0 || earmarked >= debt` and skips the swap if there is no repayable debt.
 - Positions are identified by NFT token IDs from the `AlchemistV3PositionNFT` contract.
 - `burn()` reverts with `CannotRepayOnMintBlock()` if called in the same block as a mint — not relevant for this system since we never mint.
-- `burn()` can only repay unearmarked debt. If all debt is earmarked, the burn amount is capped.
+- `burn()` can only repay unearmarked debt. If all debt is earmarked, the burn would be wasted — the vault prevents this by checking `earmarked >= debt` before swapping.
 - The Alchemist contract must be approved to spend the vault's alAssets (via `IERC20(alAsset).approve(alchemist, amount)`).
 
 - [ ] Create `src/interfaces/IVeloHarvestFactory.sol` — stub; fully defined in Milestone 0.4
@@ -428,7 +433,7 @@ interface IVeloHarvestVault {
 **Factory events:**
   - `VaultCreated(address indexed user, address indexed vault, DataTypes.AlAssetType alAssetType)`
   - `ImplementationUpdated(address indexed oldImpl, address indexed newImpl)`
-  - `ChainConfigUpdated(bytes32 oldConfigHash, bytes32 newConfigHash)` -- emits keccak256 hashes of old and new config for lightweight monitoring. Off-chain monitors can compare hashes to detect changes and read full config from storage if needed.
+  - `ChainConfigUpdated(address oldRouter, address newRouter, address oldAlETHAlchemist, address newAlETHAlchemist, address oldAlUSDAlchemist, address newAlUSDAlchemist)` -- emits the security-critical address fields that affect vault harvest behavior. Monitors can see exactly which addresses changed without querying storage.
   - `ProtocolFeeUpdated(uint256 oldFee, uint256 newFee)`
   - `CallerRewardUpdated(uint256 oldReward, uint256 newReward)`
   - `TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury)`
@@ -440,7 +445,8 @@ interface IVeloHarvestVault {
   - `HarvestCompleted(uint256 veloTotal, uint256 callerReward, uint256 protocolFee, uint256 veloPostFees)`
   - `SwappedAndBurned(uint256 veloPostFees, uint256 newlyReceived, uint256 actualBurned, uint256 alchemixPositionId)`
   - `BurnFailed(uint256 alAssetAmount, uint256 alchemixPositionId)`
-  - `HarvestSkipped(uint256 veloAmount, string reason)` -- **Note:** `veloAmount` may be zero in the withdraw-catch path (`"harvest failed during withdraw"`) where harvest failed before reaching the VELO balance check. A zero `veloAmount` indicates a generic failure path where the actual VELO amount is unknown, not that zero VELO was present. In all other `HarvestSkipped` emission paths (alchemist not set, no debt, getCDP failed, debt token mismatch), `veloAmount` reflects the actual VELO amount that was not swapped.
+  - `HarvestSkipped(uint256 veloAmount, string reason)` -- emitted when harvest completes without swapping. `veloAmount` always reflects the actual VELO amount that was not swapped (e.g., "no debt", "all debt earmarked", "alchemist not set", "getCDP failed", "debt token mismatch", "below minimum").
+  - `HarvestFailed(string reason)` -- emitted in the `withdraw()` catch-path when the harvest self-call reverted entirely. The VELO amount is unknown because the failure occurred before or during the VELO balance check. This is distinct from `HarvestSkipped` (which has a known amount) to avoid ambiguity in off-chain monitoring. The withdrawal always proceeds after this event.
   - `GaugeSkipped(address indexed lpToken, address indexed gauge, string reason)`
   - `TokenRescued(address indexed token, uint256 amount, address indexed to)`
   - `OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner)`
@@ -466,6 +472,7 @@ error NotPendingOwner();
 error CannotRescueActiveLp(address lpToken);
 error VaultPaused();
 error OnlySelf();
+error InvalidPositionId();
 ```
 
 - [ ] Document pause semantics matrix:
@@ -509,7 +516,7 @@ This is consistent: the vault owner always receives the caller reward when they 
 - [ ] Document swap route validation rules:
 
 Route validation is enforced in `setSwapRoute()` and at vault initialization. All checks must pass or the call reverts with `InvalidSwapRoute()`:
-  1. `route.length > 0`
+  1. `route.length > 0` and `route.length <= MAX_ROUTE_LENGTH` (prevents excessive gas costs and block gas limit issues from overly long routes)
   2. `route[0].from == veloToken` (read from factory via `factory.getChainConfig().veloToken`)
   3. `route[route.length - 1].to == targetAlAsset` (determined by `alAssetType` and factory chain config)
   4. For each `i > 0`: `route[i].from == route[i-1].to` (hop continuity)
@@ -552,7 +559,7 @@ Two-step ownership transfer for the vault:
 - [ ] Document read function behavior for dead or invalid gauges:
 
 **Read function behavior for dead or invalid gauges:**
-  - `getPendingRewards(address lpToken)` -- wraps `IGauge(...).earned(address(this))` in a try/catch. If the gauge is dead or the call reverts, returns 0. This is a best-effort estimate; dead gauges may still report stale `earned()` values.
+  - `getPendingRewards(address lpToken)` -- wraps `IGauge(...).earned(address(this))` in a try/catch. If the gauge is dead or the call reverts, returns 0. If `lpToken` was never deposited, `lpToGauge[lpToken]` is `address(0)` and the try/catch catches the revert on `IGauge(address(0)).earned(...)`, returning 0. Callers should not rely on a zero return to distinguish between "no pending rewards" and "invalid/never-deposited token." This is a best-effort estimate; dead gauges may still report stale `earned()` values. NatSpec should document this behavior.
   - `getTotalPendingRewards()` -- sums `getPendingRewards()` across all active LP tokens. Dead or failed gauges contribute 0 to the total. This is a best-effort aggregate estimate.
   - Both functions are documented as best-effort views suitable for UI display but not guaranteed-accurate for on-chain logic.
 
@@ -605,6 +612,7 @@ Implement the vault's initialization, ownership, and storage layout. The vault i
     ) external initializer
     ```
     - Validate `_owner != address(0)`, `_factory != address(0)`
+    - Validate `_alchemixPositionId > 0` (revert `InvalidPositionId()` — NFT position IDs start at 1; position 0 would repay debt on a nonexistent or unrelated position)
     - Validate `_slippageBps <= DataTypes.MAX_SLIPPAGE_BPS`
     - Validate swap route using hop-continuity rules (see Milestone 0.4). When the target alAsset address is `address(0)` in the chain config, an empty route is accepted and end-token validation (rule 3) is skipped.
     - Call `__ReentrancyGuard_init()`
@@ -614,9 +622,9 @@ Implement the vault's initialization, ownership, and storage layout. The vault i
     - `onlyOwner` — reverts with `NotOwner()` if `msg.sender != owner`
     - `whenNotPaused` — reads `paused()` from factory contract; reverts with `VaultPaused()` if true
   - **Owner config functions:**
-    - `setAlchemixPositionId(uint256 newId) external onlyOwner` — emits `AlchemixPositionIdUpdated(oldId, newId)`
+    - `setAlchemixPositionId(uint256 newId) external onlyOwner` — validate `newId > 0` (revert `InvalidPositionId()`); emits `AlchemixPositionIdUpdated(oldId, newId)`
     - `setSlippageTolerance(uint256 newBps) external onlyOwner` — validate <= MAX_SLIPPAGE_BPS, revert `SlippageTooHigh` if invalid; emits `SlippageToleranceUpdated(oldBps, newBps)`
-    - `setSwapRoute(IRouter.Route[] calldata newRoute) external onlyOwner` — hop-continuity validation per Milestone 0.4 rules: `route.length > 0`, `route[0].from == veloToken`, `route[last].to == targetAlAsset`, and for each `i > 0`: `route[i].from == route[i-1].to`. When the target alAsset address is `address(0)` in the chain config, an empty route is accepted and the end-token check is skipped (see zero-target handling in Milestone 0.4). Reverts with `InvalidSwapRoute()` if any applicable check fails. Emits `SwapRouteUpdated()`.
+    - `setSwapRoute(IRouter.Route[] calldata newRoute) external onlyOwner` — hop-continuity validation per Milestone 0.4 rules: `route.length > 0`, `route.length <= MAX_ROUTE_LENGTH`, `route[0].from == veloToken`, `route[last].to == targetAlAsset`, and for each `i > 0`: `route[i].from == route[i-1].to`. When the target alAsset address is `address(0)` in the chain config, an empty route is accepted and the end-token check is skipped (see zero-target handling in Milestone 0.4). Reverts with `InvalidSwapRoute()` if any applicable check fails. Emits `SwapRouteUpdated()`.
   - **Ownership transfer functions:**
     - `transferOwnership(address newOwner) external onlyOwner` — validates `newOwner != address(0)` (reverts `ZeroAddress()`); sets `pendingOwner = newOwner`, emits `OwnershipTransferStarted(owner, newOwner)`
     - `acceptOwnership() external` — requires `msg.sender == pendingOwner` (reverts `NotPendingOwner()`). Execution order: (1) `address previousOwner = owner`, (2) `owner = pendingOwner`, (3) `pendingOwner = address(0)`, (4) emit `OwnershipTransferred(previousOwner, owner)`
@@ -658,22 +666,23 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 
 - [ ] Implement `deposit(address lpToken, uint256 amount) external onlyOwner nonReentrant whenNotPaused`:
   1. Validate `amount > 0` (revert `ZeroAmount()`)
-  2. Validate `activeLpTokens.length < MAX_LP_TOKENS` (if new LP token; revert `MaxLpTokensReached(MAX_LP_TOKENS)`)
-  3. Cache chain config: `DataTypes.ChainConfig memory config = factory.getChainConfig()`
-  4. Look up gauge: `address gauge = IVoter(config.voter).gauges(lpToken)`
-  5. Validate `gauge != address(0)` — revert with `GaugeNotFound(lpToken)`
-  6. Validate `IVoter(config.voter).isAlive(gauge)` — revert with `GaugeNotAlive(lpToken)`
-  7. If this vault has existing deposits (any LP token), call `_harvest(msg.sender)` before modifying state
-  8. Transfer LP tokens from owner to vault: `IERC20(lpToken).safeTransferFrom(msg.sender, address(this), amount)`
-  9. Approve gauge to spend LP tokens: `IERC20(lpToken).forceApprove(gauge, amount)`
-  10. Stake in gauge: `IGauge(gauge).deposit(amount)`
-  11. Update state: `deposits[lpToken] += amount`
-  12. If new LP token: push to `activeLpTokens`, set `lpToGauge[lpToken] = gauge`
-  13. Emit `Deposited(lpToken, amount)`
+  2. Capture new-LP flag: `bool isNew = deposits[lpToken] == 0;` — **this MUST be captured before the `+=` increment in step 11. Checking `deposits[lpToken] == 0` after the increment would always be false, causing `activeLpTokens` to never be updated.**
+  3. Validate `if (isNew) require(activeLpTokens.length < MAX_LP_TOKENS, MaxLpTokensReached(MAX_LP_TOKENS))` — only check the cap when adding a new LP token, not when re-depositing an existing one
+  4. Cache chain config: `DataTypes.ChainConfig memory config = factory.getChainConfig()`
+  5. Look up gauge: `address gauge = IVoter(config.voter).gauges(lpToken)`
+  6. Validate `gauge != address(0)` — revert with `GaugeNotFound(lpToken)`
+  7. Validate `IVoter(config.voter).isAlive(gauge)` — revert with `GaugeNotAlive(lpToken)`
+  8. If this vault has existing deposits (any LP token), call `_harvest(msg.sender)` before modifying state
+  9. Transfer LP tokens from owner to vault: `IERC20(lpToken).safeTransferFrom(msg.sender, address(this), amount)`
+  10. Approve gauge to spend LP tokens: `IERC20(lpToken).forceApprove(gauge, amount)`
+  11. Stake in gauge: `IGauge(gauge).deposit(amount)`
+  12. Update state: `deposits[lpToken] += amount`
+  13. If `isNew`: push to `activeLpTokens`, set `lpToGauge[lpToken] = gauge` — only push on first deposit for this LP token; re-deposits must NOT push again
+  14. Emit `Deposited(lpToken, amount)`
 
   **Note:** This implementation assumes no fee-on-transfer. `deposits[lpToken] += amount` uses the requested amount directly. Fee-on-transfer LP tokens are explicitly unsupported (see Milestone 0.4).
 
-  **Deposit harvest dependency:** Step 7 calls `_harvest(msg.sender)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvest()` reverts due to a broken swap route, router failure, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
+  **Deposit harvest dependency:** Step 8 calls `_harvest(msg.sender)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvest()` reverts due to a broken swap route, router failure, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
 
 - [ ] Implement `withdraw(address lpToken, uint256 amount) external onlyOwner nonReentrant`:
 
@@ -686,7 +695,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
          try this._harvestForWithdraw(msg.sender) {
              // harvest succeeded
          } catch {
-             emit HarvestSkipped(0, "harvest failed during withdraw");
+             emit HarvestFailed("harvest failed during withdraw");
          }
      }
      ```
@@ -697,17 +706,24 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
   6. If `deposits[lpToken] == 0`: remove from `activeLpTokens` via `_removeActiveLpToken`, delete `lpToGauge[lpToken]`
   7. Emit `Withdrawn(lpToken, amount)`
 
+- [ ] Implement `_emergencyWithdrawSingle(address lpToken) internal`:
+
+  Core emergency withdrawal logic extracted into an internal function so both `emergencyWithdraw()` and `emergencyWithdrawAll()` can share it without duplicating code.
+
+  1. Get full staked amount from gauge: `uint256 amount = IGauge(lpToGauge[lpToken]).balanceOf(address(this))`
+  2. Validate `amount > 0` (revert `ZeroAmount()` — prevents emitting a misleading zero-amount event when there are no deposits)
+  3. Unstake all from gauge (no harvest): `IGauge(lpToGauge[lpToken]).withdraw(amount)`
+  4. Transfer only the gauge-withdrawn amount to owner: `IERC20(lpToken).safeTransfer(owner(), amount)`
+  5. Update state: `deposits[lpToken] = 0`, remove from `activeLpTokens` via `_removeActiveLpToken`
+  6. Emit `EmergencyWithdrawn(lpToken, amount)`
+
+  **Note:** `_emergencyWithdrawSingle` transfers only the amount unstaked from the gauge, not the vault's entire LP token balance. If additional LP tokens were sent directly to the vault (e.g., accidental donations), they remain in the vault and are recoverable via `rescueToken()`. This provides cleaner accounting and avoids unintentionally sweeping donated tokens.
+
 - [ ] Implement `emergencyWithdraw(address lpToken) external onlyOwner nonReentrant`:
 
   **Note:** `emergencyWithdraw` does NOT have `whenNotPaused`. Users must always be able to exit.
 
-  1. Get full staked amount from gauge: `uint256 amount = IGauge(lpToGauge[lpToken]).balanceOf(address(this))`
-  2. Unstake all from gauge (no harvest): `IGauge(lpToGauge[lpToken]).withdraw(amount)`
-  3. Transfer only the gauge-withdrawn amount to owner: `IERC20(lpToken).safeTransfer(owner, amount)`
-  4. Update state: `deposits[lpToken] = 0`, remove from `activeLpTokens` via `_removeActiveLpToken`
-  5. Emit `EmergencyWithdrawn(lpToken, amount)`
-
-  **Note:** `emergencyWithdraw` transfers only the amount unstaked from the gauge, not the vault's entire LP token balance. If additional LP tokens were sent directly to the vault (e.g., accidental donations), they remain in the vault and are recoverable via `rescueToken()`. This provides cleaner accounting and avoids unintentionally sweeping donated tokens.
+  Delegates to `_emergencyWithdrawSingle(lpToken)`.
 
 - [ ] Implement `emergencyWithdrawAll() external onlyOwner nonReentrant`:
 
@@ -719,7 +735,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
   }
   ```
 
-  Each iteration processes the last element, so the swap-and-pop removal does not cause any entries to be skipped.
+  Each iteration processes the last element, so the swap-and-pop removal does not cause any entries to be skipped. Both `emergencyWithdraw` and `emergencyWithdrawAll` share the same internal `_emergencyWithdrawSingle` function — no dangling references.
 
 - [ ] Implement internal helper `_removeActiveLpToken(address lpToken)`:
   - Swap-and-pop pattern to remove from array without leaving gaps
@@ -737,7 +753,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 - SafeERC20 (`safeTransfer`, `safeTransferFrom`, `forceApprove`) for all token operations — some LP tokens may not return bool. Use `forceApprove` (OZ v5) as the single canonical approval pattern.
 - Reentrancy guard on all external mutating functions
 - `withdraw`, `emergencyWithdraw`, and `emergencyWithdrawAll` do NOT have `whenNotPaused` — users must always be able to exit
-- `withdraw()` uses self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`); if harvest fails, withdrawal proceeds. When paused, harvest is skipped entirely.
+- `withdraw()` uses self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`); if harvest fails, withdrawal proceeds. When paused, harvest is skipped entirely. **Event disambiguation:** During withdraw, the harvest self-call may encounter dead gauges (silently skipped, emitting `GaugeSkipped`), or fail entirely (emitting `HarvestFailed`). A `HarvestFailed` event during withdraw does NOT mean the withdrawal failed — only that the preceding harvest attempt did not complete. The LP withdrawal always proceeds regardless.
 - Emergency withdraw does NOT call `_harvest()` — this is intentional so it works even if harvest reverts
 - Emergency withdraw transfers only gauge-withdrawn amount; extra LP tokens from direct donations remain in vault for `rescueToken()`
 - Gauge `balanceOf` is used for emergency withdraw amount (not internal tracking) as a safety measure
@@ -817,7 +833,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
 
     - Validate `_implementation != address(0)`
     - Validate `_treasury != address(0)`
-    - Validate fee BPS within bounds
+    - Validate fee BPS within bounds: individual caps (`_protocolFeeBps <= MAX_PROTOCOL_FEE_BPS`, `_callerRewardBps <= MAX_CALLER_REWARD_BPS`) and combined cap (`_protocolFeeBps + _callerRewardBps <= MAX_TOTAL_FEE_BPS`)
     - Initialize ownership to deployer using the OZ ownership constructor pattern required by the installed version (e.g., `Ownable(msg.sender)` for OZ v5)
 
   - **`createVault()` function:**
@@ -829,17 +845,18 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
         IRouter.Route[] calldata swapRoute
     ) external whenNotPaused returns (address vault)
     ```
-    1. Clone implementation: `vault = Clones.clone(implementation)`
-    2. Initialize clone: `IVeloHarvestVault(vault).initialize(msg.sender, address(this), alAssetType, alchemixPositionId, slippageBps, swapRoute)`
-    3. Register: `userVaults[msg.sender].push(vault)`, `allVaults.push(vault)`
-    4. Emit `VaultCreated(msg.sender, vault, alAssetType)`
-    5. Return vault address
+    1. Validate `alchemixPositionId > 0` (revert `InvalidPositionId()`)
+    2. Clone implementation: `vault = Clones.clone(implementation)`
+    3. Initialize clone: `IVeloHarvestVault(vault).initialize(msg.sender, address(this), alAssetType, alchemixPositionId, slippageBps, swapRoute)`
+    4. Register: `userVaults[msg.sender].push(vault)`, `allVaults.push(vault)`
+    5. Emit `VaultCreated(msg.sender, vault, alAssetType)`
+    6. Return vault address
 
   - **Admin functions (onlyOwner):** Every setter emits an event with old and new values (see Milestone 0.4 event list):
     - `setImplementation(address newImpl)` — for future clones only; existing clones are unaffected. Emits `ImplementationUpdated(oldImpl, newImpl)`.
-    - `setChainConfig(DataTypes.ChainConfig calldata newConfig)` — update chain addresses (e.g. when Alchemix v3 deploys). Applies the same address validation rules as the constructor (see ChainConfig validation table above). Emits `ChainConfigUpdated(keccak256(abi.encode(oldConfig)), keccak256(abi.encode(newConfig)))`. Monitors can detect changes via hash comparison and read full config from storage.
-    - `setProtocolFee(uint256 newFeeBps)` — validate <= MAX_PROTOCOL_FEE_BPS (revert `FeeTooHigh`). Emits `ProtocolFeeUpdated(oldFee, newFee)`.
-    - `setCallerReward(uint256 newRewardBps)` — validate <= MAX_CALLER_REWARD_BPS (revert `FeeTooHigh`). Emits `CallerRewardUpdated(oldReward, newReward)`.
+    - `setChainConfig(DataTypes.ChainConfig calldata newConfig)` — update chain addresses (e.g. when Alchemix v3 deploys). Applies the same address validation rules as the constructor (see ChainConfig validation table above). Emits `ChainConfigUpdated(oldConfig.router, newConfig.router, oldConfig.alETHAlchemist, newConfig.alETHAlchemist, oldConfig.alUSDAlchemist, newConfig.alUSDAlchemist)` with the security-critical fields that affect vault behavior.
+    - `setProtocolFee(uint256 newFeeBps)` — validate `newFeeBps <= MAX_PROTOCOL_FEE_BPS` AND `newFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `ProtocolFeeUpdated(oldFee, newFee)`.
+    - `setCallerReward(uint256 newRewardBps)` — validate `newRewardBps <= MAX_CALLER_REWARD_BPS` AND `protocolFeeBps + newRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `CallerRewardUpdated(oldReward, newReward)`.
     - `setTreasury(address newTreasury)` — validate non-zero (revert `ZeroAddress()`). Emits `TreasuryUpdated(oldTreasury, newTreasury)`.
     - `pause()` / `unpause()` — global pause toggle (inherited from OZ `Pausable`)
 
@@ -928,7 +945,7 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   2. Get total VELO balance (sweep-all model): `uint256 veloBalance = IERC20(config.veloToken).balanceOf(address(this))`
 
      This captures the vault's entire VELO balance, including any previously accumulated VELO from earlier no-debt/skip scenarios. This is the intended "sweep-all" model (see Milestone 0.4). Users who want to extract accumulated VELO before it gets processed should call `rescueToken(veloToken, amount)` first. This balance check runs even when there are no active LPs, ensuring previously accumulated VELO gets processed.
-  3. If `veloBalance == 0`, return 0
+  3. If `veloBalance < MINIMUM_HARVEST_VELO`, emit `HarvestSkipped(veloBalance, "below minimum")` and return 0. This covers both the zero-VELO case (providing observability for a previously silent path) and the micro-balance case (preventing router reverts from tiny swap amounts).
   4. Read fee config from factory: `uint256 callerRewardBps = factory.getCallerRewardBps()`
   5. Read fee config from factory: `uint256 protocolFeeBps = factory.getProtocolFeeBps()`
   6. Calculate caller reward: `uint256 callerReward = (veloBalance * callerRewardBps) / MAX_BPS`
@@ -953,7 +970,7 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   - **NOT `nonReentrant`** — `withdraw()` already holds the reentrancy lock; applying `nonReentrant` here would cause the self-call to revert
   - `msg.sender == address(this)` guard — prevents arbitrary external callers from invoking this function. The only legitimate caller is the contract itself via the self-call in `withdraw()`
   - **`rewardRecipient` parameter** — when `withdraw()` does `this._harvestForWithdraw(msg.sender)`, `msg.sender` inside the external call becomes `address(this)` (Solidity external self-call semantics). The `rewardRecipient` parameter passes the original caller's address through so `_harvest()` sends the caller reward to the vault owner, not to the contract itself.
-  - This function is NOT part of the `IVeloHarvestVault` interface. It is an implementation detail, not a public API surface. External tooling should not call it. It is implemented on the concrete `VeloHarvestVault` contract only and is invoked via `this._harvestForWithdraw(...)` from within the implementation; the Solidity `this.` syntax routes through the contract's own external dispatch, which works regardless of interface membership. Despite being excluded from the interface, `_harvestForWithdraw()` must have full NatSpec documentation (purpose, parameters, security rationale, and reentrancy note) for audit readability and internal tooling.
+  - This function is NOT part of the `IVeloHarvestVault` interface. It is an implementation detail, not a public API surface. External tooling should not call it. It is implemented on the concrete `VeloHarvestVault` contract only and is invoked via `this._harvestForWithdraw(...)` from within the implementation; the Solidity `this.` syntax routes through the contract's own external dispatch, which works regardless of interface membership. Despite being excluded from the interface, `_harvestForWithdraw()` must have full NatSpec documentation (purpose, parameters, security rationale, and reentrancy note) for audit readability and internal tooling. **ABI visibility note:** Because this function is `external`, it appears in the contract's ABI and will be visible on block explorers. The `OnlySelf` guard prevents external callers from invoking it. NatSpec should clearly state that integrators and block explorer users should ignore this function — it is an internal implementation detail exposed only to satisfy Solidity's `try/catch` requirement.
   - `deposit()` does NOT use this wrapper. It calls `_harvest(msg.sender)` directly (internal call). If harvest fails during deposit, the deposit reverts — this is intentional (see "Deposit harvest dependency" in architectural decisions).
 
 **Harvest reward policy:** Caller reward is always paid to `rewardRecipient`, which is:
@@ -972,7 +989,8 @@ This ensures consistent behavior: the vault owner always receives the caller rew
 
 **Testing (unit)**
 
-- [ ] Harvest with no active LPs and no VELO returns 0
+- [ ] Harvest with no active LPs and no VELO returns 0, emits `HarvestSkipped(0, "below minimum")`
+- [ ] Harvest with VELO below `MINIMUM_HARVEST_VELO` returns 0, emits `HarvestSkipped(veloBalance, "below minimum")`
 - [ ] Harvest with no active LPs but VELO in vault: sweep-all processes accumulated VELO
 - [ ] Harvest claims from all active (alive) gauges
 - [ ] Dead gauge is skipped during harvest (no revert, `GaugeSkipped` event emitted with "gauge not alive")
@@ -1018,10 +1036,10 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
          return;
      }
      try IAlchemistV3(alchemist).getCDP(alchemixPositionId) returns (
-         uint256 debt, uint256, uint256
+         uint256 debt, uint256 earmarked, uint256
      ) {
-         if (debt == 0) {
-             emit HarvestSkipped(veloAmount, "no debt");
+         if (debt == 0 || earmarked >= debt) {
+             emit HarvestSkipped(veloAmount, debt == 0 ? "no debt" : "all debt earmarked");
              return;
          }
      } catch {
@@ -1060,51 +1078,53 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
          veloAmount, minOut, _swapRoute, address(this), block.timestamp
      );
 
+     IERC20(veloToken).forceApprove(router, 0); // zero residual router approval for defensive consistency
+
      uint256 balanceAfterSwap = IERC20(alAssetToken).balanceOf(address(this));
      uint256 newlyReceived = balanceAfterSwap - balanceBeforeSwap;
      ```
-  6. **Burn alAsset for debt repayment (balance-delta measurement):**
+  6. **Burn alAsset for debt repayment (total-balance burn):**
      ```solidity
-     IERC20(alAssetToken).forceApprove(alchemist, newlyReceived);
+     IERC20(alAssetToken).forceApprove(alchemist, balanceAfterSwap);
 
-     try IAlchemistV3(alchemist).burn(newlyReceived, alchemixPositionId) {
+     try IAlchemistV3(alchemist).burn(balanceAfterSwap, alchemixPositionId) {
          uint256 balanceAfterBurn = IERC20(alAssetToken).balanceOf(address(this));
          uint256 actualBurned = balanceAfterSwap - balanceAfterBurn;
          IERC20(alAssetToken).forceApprove(alchemist, 0);
          emit SwappedAndBurned(veloAmount, newlyReceived, actualBurned, alchemixPositionId);
      } catch {
          IERC20(alAssetToken).forceApprove(alchemist, 0);
-         emit BurnFailed(newlyReceived, alchemixPositionId);
+         emit BurnFailed(balanceAfterSwap, alchemixPositionId);
      }
      ```
 
      Key points:
-     - **Three balance measurements** ensure clean separation between preexisting alAsset and newly swapped alAsset:
-       - `balanceBeforeSwap` — vault's alAsset balance before the swap (may include preexisting alAsset from prior failed burns or manual transfers)
-       - `balanceAfterSwap` — vault's alAsset balance after the swap
+     - **Three balance measurements** track the full lifecycle:
+       - `balanceBeforeSwap` — vault's alAsset balance before the swap (may include preexisting alAsset from prior failed/partial burns or manual transfers)
+       - `balanceAfterSwap` — vault's total alAsset balance after the swap (new + preexisting)
        - `balanceAfterBurn` — vault's alAsset balance after burn
-     - `newlyReceived = balanceAfterSwap - balanceBeforeSwap` — only the amount received from the swap, excluding preexisting balance
-     - `actualBurned = balanceAfterSwap - balanceAfterBurn` — what Alchemix actually consumed (may be less than `newlyReceived` if amount exceeds unearmarked debt)
-     - Burn is called with `newlyReceived`, not the vault's entire alAsset balance. Preexisting alAsset from prior failed burns remains untouched and is recoverable via `rescueToken()`
+     - `newlyReceived = balanceAfterSwap - balanceBeforeSwap` — amount received from this swap only (used in event for observability)
+     - `actualBurned = balanceAfterSwap - balanceAfterBurn` — what Alchemix actually consumed (may be less than `balanceAfterSwap` if amount exceeds unearmarked debt; may be greater than `newlyReceived` if preexisting alAsset was also burned)
+     - **Burn uses total vault alAsset balance (`balanceAfterSwap`), not just `newlyReceived`.** This ensures accumulated alAsset from prior partial burns or failed burns is included in the burn attempt, rather than sitting idle until manually rescued. Remaining alAsset after burn (if any) is still recoverable via `rescueToken()`.
      - Zero residual approval after burn (whether success or failure) using `forceApprove(alchemist, 0)`
      - `try/catch` handles `BurnLimitExceeded` or other reverts gracefully; alAsset stays in vault
 
-**Note:** There are no dedicated `withdrawVelo()` or `withdrawAlAsset()` functions. Accumulated VELO (from no-debt skips) and alAsset (from failed burns) are extracted via `rescueToken()`, which is the single token extraction mechanism for all non-active-LP tokens. See Milestone 0.4 rescue policy.
+**Note:** There are no dedicated `withdrawVelo()` or `withdrawAlAsset()` functions. Accumulated VELO (from no-debt skips) is extracted via `rescueToken()`. Accumulated alAsset is automatically included in the next burn attempt; any remainder after burn is recoverable via `rescueToken()`. See Milestone 0.4 rescue policy.
 
 **Swap route configuration notes:**
 
 The swap route is stored in the vault and set at creation. Default routes (to be documented per chain):
 
-- **Optimism (VELO -> alETH):** VELO -> WETH -> alETH (or direct if pool exists)
-- **Optimism (VELO -> alUSD):** VELO -> USDC -> alUSD (or direct if pool exists)
+- **Optimism (VELO -> alETH):** VELO -> WETH -> alETH (or direct if pool exists). **Pending verification:** alETH Velodrome pools on Optimism may not exist yet. alETH support is contingent on pool creation and sufficient liquidity. This must be verified as an integration prerequisite before deploying alETH vaults.
+- **Optimism (VELO -> alUSD):** VELO -> USDC -> alUSD (or direct if pool exists). alUSD exists on Optimism and routes are more certain.
 
 The exact route depends on available liquidity pools at deployment time. The owner can update the route via `setSwapRoute()` if better routes become available.
 
 **Security considerations**
 
-- Slippage protection via `minOut` calculation using `getAmountsOut` + slippage BPS
+- Slippage protection via `minOut` calculation using `getAmountsOut` + slippage BPS. **Sandwich / MEV risk (known limitation):** `getAmountsOut` reads the current spot price from the pool, which can be manipulated in the same block. An attacker can: (1) move the pool price, (2) vault calls `getAmountsOut` and gets a degraded `expectedOut`, (3) `minOut` is based on the already-manipulated price, (4) vault swaps at the manipulated price, (5) attacker reverses for profit. The `slippageBps` parameter only protects against movement *beyond* the already-manipulated spot price. For large VELO positions, this is economically attractive to attack. Mitigations: use conservative default slippage (0.5%), keep VELO positions reasonably sized, and consider adding an optional `minAmountOut` parameter to `harvest()` in a future version to allow off-chain price calculation. This is a well-known DEX integration tradeoff and should be documented in `SECURITY.md`.
 - `forceApprove` for all approvals (OZ v5 canonical pattern -- handles tokens that require approve-to-zero)
-- Zero residual approval after burn (both success and failure paths) to minimize lingering allowances
+- Zero residual approval after both swap (router) and burn (alchemist) in success paths to minimize lingering allowances
 - `try/catch` around alchemist `burn()` call to prevent harvest from reverting entirely
 - Three-point balance measurement (`balanceBeforeSwap`, `balanceAfterSwap`, `balanceAfterBurn`) isolates newly swapped alAsset from preexisting balance and reports actual burned amount accurately
 - `block.timestamp` as deadline (immediate execution) — acceptable since the harvest is triggered by a user/keeper and MEV protection is via slippage
@@ -1114,7 +1134,8 @@ The exact route depends on available liquidity pools at deployment time. The own
 **Testing (unit with mocks)**
 
 - [ ] Swap and burn: VELO -> alAsset -> burn, correct amounts
-- [ ] No-debt skip: VELO stays in vault when debt == 0
+- [ ] No-debt skip: VELO stays in vault when debt == 0, emits `HarvestSkipped` with "no debt"
+- [ ] All-earmarked skip: VELO stays in vault when `earmarked >= debt` (debt exists but is fully earmarked), emits `HarvestSkipped` with "all debt earmarked" — swap fees/slippage are not wasted
 - [ ] Alchemist not set: VELO stays in vault
 - [ ] getCDP revert: VELO stays in vault (graceful)
 - [ ] Burn revert: alAsset stays in vault, event emitted
@@ -1122,7 +1143,8 @@ The exact route depends on available liquidity pools at deployment time. The own
 - [ ] debtToken mismatch: harvest skips swap/burn when alchemist's debtToken doesn't match configured alAsset, emits `HarvestSkipped`
 - [ ] debtToken check failure: harvest skips gracefully when debtToken() call reverts
 - [ ] rescueToken for VELO: owner can retrieve accumulated VELO via `rescueToken(veloToken, amount)`
-- [ ] rescueToken for alAsset: owner can retrieve accumulated alAsset via `rescueToken(alAssetToken, amount)`
+- [ ] rescueToken for alAsset: owner can retrieve remaining alAsset (after burn attempts) via `rescueToken(alAssetToken, amount)`
+- [ ] Accumulated alAsset from failed burn is included in next successful burn: vault with preexisting alAsset from prior failed burn; next harvest swaps new VELO and burns total `balanceAfterSwap` (new + preexisting)
 - [ ] **Route validation with zero alAsset target:** vault creation with zero alAsset address in chain config accepts empty route; `setSwapRoute()` with zero target skips end-token validation (rule 3) but still enforces rules 1, 2, 4 for non-empty routes; once alAsset address is set via `setChainConfig()`, `setSwapRoute()` enforces full validation including end-token check
 
 **Done when**
@@ -1158,9 +1180,9 @@ Build mock contracts for all external dependencies to enable isolated unit testi
 - [ ] `test/mocks/MockVoter.sol` — simulates `gauges(pool)` mapping and `isAlive(gauge)`
   - Admin can register LP -> gauge mappings
 - [ ] `test/mocks/MockAlchemistV3.sol` — simulates `burn()`, `getCDP()`, `debtToken()`
-  - Tracks per-position debt
+  - Tracks per-position debt and earmarked amounts separately
   - `burn()` reduces debt and takes alAssets from caller
-  - `getCDP()` returns configurable debt/earmarked/collateral
+  - `getCDP()` returns configurable debt/earmarked/collateral (earmarked must be independently configurable to test the `earmarked >= debt` skip path)
   - Can be configured to revert
 
 **Done when**
@@ -1192,17 +1214,20 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
   - **Harvest -- dead gauge:** dead gauge is skipped during harvest (no revert, `GaugeSkipped` event emitted with "gauge not alive", LP still withdrawable)
   - **Harvest -- alive gauge getReward revert:** alive gauge whose `getReward()` reverts is skipped (no revert, `GaugeSkipped` event emitted with "getReward failed", other gauges still process, LP still withdrawable)
   - **Harvest -- sweep-all:** preexisting VELO in vault before new harvest is included in processing
-  - **Harvest -- preexisting alAsset:** preexisting alAsset in vault before new swap/burn does not interfere with accounting; `newlyReceived` reflects only the swap output; preexisting alAsset remains untouched
+  - **Harvest -- preexisting alAsset included in burn:** preexisting alAsset in vault before new swap/burn is included in the burn amount (`balanceAfterSwap`); `newlyReceived` still reflects only the swap output (for event data); `actualBurned` reflects total consumed by Alchemix (may exceed `newlyReceived`)
   - **Swap and burn:** full flow with mocks, no-debt skip, alchemist-not-set skip, burn revert handling
   - **Swap and burn -- partial consumption:** `burn()` consumes less than `newlyReceived`; `actualBurned` is reported correctly via balance delta
-  - **Swap and burn -- preexisting alAsset isolation:** vault holds preexisting alAsset from prior failed burn; new swap produces `newlyReceived`; burn only consumes from `newlyReceived`; preexisting alAsset remains in vault untouched
-  - **Swap route validation:** route connectivity validation failure (disconnected hops revert with `InvalidSwapRoute`), wrong start token reverts, wrong end token reverts, empty route reverts
+  - **Swap and burn -- accumulated alAsset included:** vault holds preexisting alAsset from prior failed/partial burn; new swap produces `newlyReceived`; burn uses total `balanceAfterSwap` (new + preexisting); `actualBurned` may exceed `newlyReceived` when preexisting alAsset is consumed
+  - **Swap and burn -- accumulated alAsset from failed burn:** previous burn fails entirely (alAsset accumulates); next successful harvest includes accumulated alAsset in burn amount; `actualBurned` reflects total burned including preexisting
+  - **Swap route validation:** route connectivity validation failure (disconnected hops revert with `InvalidSwapRoute`), wrong start token reverts, wrong end token reverts, empty route reverts, route exceeding `MAX_ROUTE_LENGTH` reverts
+  - **Position ID validation:** zero position ID rejected in `initialize()`, `setAlchemixPositionId()`, and `createVault()` with `InvalidPositionId()`
   - **Setters:** position ID update, slippage update, swap route update, input validation
   - **Access control:** non-owner reverts on all restricted functions
   - **Pause:** paused-state matrix -- test every mutating function against paused/unpaused states: `deposit` blocked, `withdraw` allowed, `emergencyWithdraw` allowed, `emergencyWithdrawAll` allowed, `harvest` blocked
   - **Withdraw while paused:** harvest self-call is skipped entirely, withdrawal succeeds, no external calls to router/alchemist
-  - **Withdraw with broken swap route:** harvest fails in self-call try/catch, withdrawal still succeeds, `HarvestSkipped` event emitted
+  - **Withdraw with broken swap route:** harvest fails in self-call try/catch, withdrawal still succeeds, `HarvestFailed` event emitted
   - **Withdraw with broken router:** harvest reverts inside self-call, try/catch catches it, withdrawal proceeds
+  - **Withdraw with dead gauge:** harvest self-call partially completes (dead gauge skipped with `GaugeSkipped`), LP withdrawal from remaining alive gauges proceeds; `HarvestFailed` does not block withdrawal
   - **_harvestForWithdraw access control:** external call to `_harvestForWithdraw()` from any address other than the contract itself reverts with `OnlySelf()`
   - **Ownership transfer:** two-step flow works end-to-end; unauthorized `acceptOwnership` reverts with `NotPendingOwner`
   - **Ownership transfer -- zero address:** `transferOwnership(address(0))` reverts with `ZeroAddress()`
@@ -1222,7 +1247,8 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
   - **Deployment:** correct initial state
   - **createVault:** deploys functional clone, registers in mappings, multiple vaults per user (unlimited)
   - **Admin functions:** setImplementation, setChainConfig, setProtocolFee, setCallerReward, setTreasury, pause/unpause
-  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct config hashes, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `TreasuryUpdated`)
+  - **Combined fee cap:** `protocolFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` enforced in constructor, `setProtocolFee()`, and `setCallerReward()`; setting one fee to a value that would exceed the combined cap with the other fee reverts
+  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct router/alchemist address fields, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `TreasuryUpdated`)
   - **Access control:** non-owner reverts
   - **Ownable2Step:** two-step transfer works correctly
   - **Pause:** createVault reverts when paused
@@ -1443,20 +1469,23 @@ Systematic security review and hardening of all contracts before deployment.
 - [ ] **Access control:** Verify `onlyOwner` on all restricted functions. Verify no unprotected state changes. Verify two-step ownership transfer (`transferOwnership` / `acceptOwnership`) is correctly implemented.
 - [ ] **Integer overflow/underflow:** Solidity 0.8+ handles this, but verify no unchecked blocks have issues.
 - [ ] **Token handling:** SafeERC20 everywhere. Handle tokens that don't return bool. Fee-on-transfer LP tokens are explicitly unsupported — verify this assumption is documented and no balance-delta is needed for standard LP tokens.
-- [ ] **Approve patterns:** Verify all approvals use `forceApprove` (OZ v5). Verify all residual approvals are zeroed after use (especially after `burn()` calls).
-- [ ] **Front-running:** Swap slippage protection via `minOut`. No other front-runnable operations.
-- [ ] **Denial of service:** `activeLpTokens` array is capped at 10. Gauge iteration is bounded. No unbounded loops. `emergencyWithdrawAll` uses while-loop pattern to avoid skipping.
+- [ ] **Approve patterns:** Verify all approvals use `forceApprove` (OZ v5). Verify all residual approvals are zeroed after use: router approval zeroed after swap, alchemist approval zeroed after burn (both success and failure paths).
+- [ ] **Front-running / MEV:** Swap slippage protection via `minOut` based on `getAmountsOut`. **Known risk:** `getAmountsOut` reads spot price which is manipulable in the same block (sandwich attacks). The `slippageBps` only protects against movement beyond the already-manipulated price. This is documented as a known limitation (see Milestone 3.2). Conservative default slippage (0.5%) is set. Future versions may add an optional `minAmountOut` parameter to `harvest()` for off-chain price calculation. Document this risk in `SECURITY.md`.
+- [ ] **Denial of service:** `activeLpTokens` array is capped at 10. Gauge iteration is bounded. No unbounded loops. `emergencyWithdrawAll` uses while-loop pattern to avoid skipping. Total harvest fees bounded at `MAX_TOTAL_FEE_BPS` (5% combined).
 - [ ] **Proxy storage collisions:** Verify no storage layout issues between implementation and proxy. Implementation uses `_disableInitializers()` in constructor.
 - [ ] **Pause mechanism:** Verify pausing matches the pause matrix defined in Milestone 0.4. Blocked: `createVault`, `deposit`, `harvest`. Allowed: `withdraw`, `emergencyWithdraw`, `emergencyWithdrawAll`, `rescueToken`, all setters, ownership transfer.
 - [ ] **Edge cases:**
   - What if the factory owner changes chain config while vaults are active? Vaults read config from factory live — if config changes, existing vaults will use new addresses. This is by design (e.g., updating Alchemist address when v3 deploys).
   - What if VELO token address changes? This would require a factory update and would NOT automatically update existing vaults' swap routes. Document this limitation.
   - Dead gauge handling is implemented in Milestone 3.1 (skip during harvest, user can still withdraw). Verify this works correctly during security review.
+  - **Killed gauge withdrawal (critical):** Verify against Velodrome's actual killed-gauge implementation that `IGauge(gauge).withdraw(amount)` succeeds for killed gauges. If killed gauges revert on `withdraw()`, users could be permanently stuck — both `withdraw()` and `emergencyWithdraw()` call `gauge.withdraw()` without a fallback. This is a critical deployment prerequisite that must be verified before mainnet launch.
   - Route structural validation (hop continuity, start/end tokens) does not guarantee executable liquidity. Pool existence and sufficient liquidity are operational assumptions. Invalid-but-structurally-correct routes fail at swap time; the withdraw try/catch ensures this does not block user exit.
+  - **alETH pool existence (Optimism):** alETH Velodrome pools on Optimism may not exist at launch. Verify that a viable VELO -> ... -> alETH swap route exists before deploying alETH vaults. alUSD routes are more certain. If no pool exists, alETH vaults should not be created until one does.
+  - **alAsset address change (operational risk):** If admin updates `config.alETH` or `config.alUSD` to a new address (e.g., V3 uses different alAsset than V2), existing vaults with swap routes ending in the old token address will fail at swap time. The `debtToken()` mismatch check catches some cases, but if both `alchemist.debtToken()` and `config.alETH` are updated consistently, the route's `_swapRoute[last].to` still points to the old token. Affected vault owners must manually call `setSwapRoute()` to update their route. This should be prominently documented in `SECURITY.md`, and the `ChainConfigUpdated` event provides sufficient data for tooling to detect and alert affected users.
 
 - [ ] **Withdraw exitability guarantee:** Verify that `withdraw()` never reverts due to harvest path failures. The self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`) must catch all possible revert paths including router failures, alchemist failures, gauge getReward failures, and unexpected external reverts. Verify that `_harvestForWithdraw(address rewardRecipient)` is external (required for try/catch) and NOT nonReentrant (would fail since withdraw already holds the lock). Verify `rewardRecipient` is correctly passed through to `_harvest()`. When factory is paused, verify harvest is skipped entirely within `withdraw()` (no self-call). This is the single most important safety invariant for user asset protection.
 
-- [ ] **Trust model documentation:** Factory admin is a trusted role with the power to redirect swap/burn endpoints and thereby influence future harvest behavior of all vaults. Users retain LP withdrawal control at all times regardless of admin actions. Every admin config change emits an event for off-chain monitoring. The intended long-term path is transition to a pause-only role or multisig. Document these trust assumptions in `docs/SECURITY.md`.
+- [ ] **Trust model documentation:** Factory admin is a trusted role with the power to redirect swap/burn endpoints and thereby influence future harvest behavior of all vaults. Admin config changes (chainConfig, implementation, treasury) take immediate effect with no timelock. A compromised admin could redirect swaps to an attacker-controlled router or burn targets to a different alchemist. Users should verify admin identity before depositing. Users retain LP withdrawal control at all times regardless of admin actions. Every admin config change emits an event (including security-critical address fields in `ChainConfigUpdated`) for off-chain monitoring. The intended long-term path is transition to a pause-only role, multisig, or timelock-gated governance contract. A timelock is recommended for future governance upgrades. Document these trust assumptions in `docs/SECURITY.md`. Also document the `getAmountsOut` sandwich/MEV risk: spot price manipulation can degrade swap outcomes despite slippage protection. Users with large VELO positions should be aware of this limitation.
 
 - [ ] **Rescue function verification:** Verify `rescueToken()` correctly prevents rescue of actively staked LP tokens by checking `deposits[token] > 0` (reverts with `CannotRescueActiveLp`). Verify the simplified check is sufficient: `deposits` and `activeLpTokens` are always kept in sync, so checking the mapping alone is deterministic and gas-cheap. Verify the invariant: users can recover any ERC-20 sent to their vault (including VELO, alAsset, and accidental transfers) via `rescueToken()`, except tokens that are actively staked as LP principal. Actively staked LP tokens are recoverable via `withdraw()` or `emergencyWithdraw()`.
 
@@ -1631,6 +1660,7 @@ Deploy the factory and implementation to Optimism mainnet.
 - [ ] `burn()` reduces Alchemix debt correctly; `actualBurned` reported via balance delta
 - [ ] `burn()` partial consumption: actual burned less than `newlyReceived` handled correctly
 - [ ] No-debt case: VELO accumulates in vault, user can recover via `rescueToken()`
+- [ ] All-earmarked case: VELO stays in vault when `earmarked >= debt`, swap is skipped (no wasted fees/slippage)
 - [ ] Alchemist-not-set case: VELO accumulates gracefully
 - [ ] `burn()` revert case: alAsset stays in vault, zero residual approval
 - [ ] Sweep-all: preexisting VELO included in harvest processing (even with zero active LPs)
