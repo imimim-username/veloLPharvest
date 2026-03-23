@@ -15,7 +15,7 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Multiple LP tokens per vault** (capped at 10 for gas safety during harvest)
 - **One alAsset type per vault** (alETH or alUSD, chosen at vault creation)
 - **Alchemix position NFT ID** set at vault creation, updatable later by owner
-- **Harvest triggers:** (a) `deposit()` auto-harvests (reverts if harvest fails); `withdraw()` attempts harvest when unpaused (proceeds regardless of harvest outcome), (b) public `harvest()` with 0.5% VELO reward to caller
+- **Harvest triggers:** (a) `deposit()` auto-harvests (reverts if harvest fails); `withdraw()` attempts harvest when unpaused (proceeds regardless of harvest outcome), (b) public `harvest()` with configurable VELO reward to caller (default 0.5%, set via factory `callerRewardBps`)
 - **Harvest reward policy:** caller reward is always paid to `rewardRecipient` (passed to `_harvest()`). For public `harvest()` and `deposit()`, this is `msg.sender`. For `withdraw()`, this is the vault owner's address (passed through the self-call). No special-casing within `_harvest()` itself.
 - **Sweep-all harvest model:** harvest processes all VELO currently held by the vault (`balanceOf`), not just newly claimed rewards. Previously accumulated VELO from no-debt skips is included.
 - **Protocol fee:** configurable by factory admin (e.g. 0.5-2%), paid in VELO before swap
@@ -57,7 +57,7 @@ sequenceDiagram
     Note over Vault: Time passes, VELO accrues
 
     User->>Vault: withdraw(lpToken, amount)
-    Vault->>Vault: _harvestForWithdraw(owner) [self-call, try/catch; skip if paused]
+    Vault->>Vault: this._harvestForWithdraw(msg.sender) [self-call, try/catch; skip if paused]
     Vault->>Gauge: withdraw(amount)
     Vault->>User: transfer LP tokens
 
@@ -673,7 +673,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 
   **Note:** This implementation assumes no fee-on-transfer. `deposits[lpToken] += amount` uses the requested amount directly. Fee-on-transfer LP tokens are explicitly unsupported (see Milestone 0.4).
 
-  **Deposit harvest dependency:** Step 6 calls `_harvest(msg.sender)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvest()` reverts due to a broken swap route, router failure, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
+  **Deposit harvest dependency:** Step 7 calls `_harvest(msg.sender)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvest()` reverts due to a broken swap route, router failure, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
 
 - [ ] Implement `withdraw(address lpToken, uint256 amount) external onlyOwner nonReentrant`:
 
@@ -752,7 +752,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 - [ ] Withdraw: unstakes, transfers to owner, updates state
 - [ ] Withdraw more than deposited reverts
 - [ ] Withdraw all of one LP token removes it from activeLpTokens
-- [ ] Emergency withdraw: bypasses harvest, returns all tokens
+- [ ] Emergency withdraw: bypasses harvest, returns only gauge-withdrawn amount (donated extras remain for rescueToken)
 - [ ] Emergency withdraw all: empties vault completely
 - [ ] Only owner can deposit/withdraw
 - [ ] Read functions return correct values
@@ -786,7 +786,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
     - `address public implementation` — vault implementation address
     - `DataTypes.ChainConfig public chainConfig` — chain-specific addresses
     - `uint256 public protocolFeeBps` — protocol fee (default e.g. 100 = 1%)
-    - `uint256 public callerRewardBps` — harvest caller reward (fixed 50 = 0.5%)
+    - `uint256 public callerRewardBps` — harvest caller reward (default 50 = 0.5%)
     - `address public treasury` — protocol fee recipient
     - `mapping(address user => address[] vaults) public userVaults` — user's vaults
     - `address[] public allVaults` — registry of all deployed vaults
@@ -1108,7 +1108,7 @@ The exact route depends on available liquidity pools at deployment time. The own
 - `try/catch` around alchemist `burn()` call to prevent harvest from reverting entirely
 - Three-point balance measurement (`balanceBeforeSwap`, `balanceAfterSwap`, `balanceAfterBurn`) isolates newly swapped alAsset from preexisting balance and reports actual burned amount accurately
 - `block.timestamp` as deadline (immediate execution) — acceptable since the harvest is triggered by a user/keeper and MEV protection is via slippage
-- If swap reverts (slippage exceeded), the entire harvest reverts — VELO stays in the vault (already claimed from gauges), nothing is lost
+- If swap reverts (slippage exceeded), the entire harvest reverts — VELO remains in the vault as an ERC-20 balance (it was already claimed from gauges and transferred to the vault during the gauge-claim loop; the revert only unwinds the swap, not the claim). Nothing is lost; the VELO will be processed on the next successful harvest.
 - Accumulated alAssets/VELO in vault are only extractable by owner (via `rescueToken()`)
 
 **Testing (unit with mocks)**
@@ -1185,7 +1185,7 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
   - **Deposit:** single LP, multiple LPs, max LP limit, invalid gauge, gauge not alive, duplicate LP deposit does not push duplicate array entries
   - **Deposit with broken harvest path:** deposit with existing LP positions reverts when harvest path is broken (broken swap route, router failure); first-time deposit (no prior LPs) succeeds regardless of harvest path health
   - **Withdraw:** partial, full, over-balance revert, updates state correctly, withdrawal after factory pause still succeeds
-  - **Emergency withdraw:** bypasses harvest, returns all tokens, works when harvest would revert
+  - **Emergency withdraw:** bypasses harvest, returns only gauge-withdrawn amount (donated extras remain for rescueToken), works when harvest would revert
   - **Emergency withdraw all:** `emergencyWithdrawAll()` array mutation correctness (no skipped entries via while-loop)
   - **Harvest:** claims from all gauges, fee distribution, caller reward, owner self-harvest
   - **Harvest -- owner vs third-party:** owner harvest and third-party harvest both pay caller reward to `msg.sender` (same policy, different sender)
