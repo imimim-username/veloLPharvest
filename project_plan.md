@@ -15,9 +15,11 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Multiple LP tokens per vault** (capped at 10 for gas safety during harvest)
 - **One alAsset type per vault** (alETH or alUSD, chosen at vault creation)
 - **Alchemix position NFT ID** set at vault creation (must be > 0; NFT IDs start at 1), updatable later by owner
-- **Harvest triggers:** (a) `deposit()` auto-harvests (reverts if harvest fails); `withdraw()` attempts harvest when unpaused (proceeds regardless of harvest outcome), (b) public `harvest()` with configurable VELO reward to caller (default 0.5%, set via factory `callerRewardBps`)
-- **Harvest reward policy:** caller reward is always paid to `rewardRecipient` (passed to `_harvest()`). For public `harvest()` and `deposit()`, this is `msg.sender`. For `withdraw()`, this is the vault owner's address (passed through the self-call). No special-casing within `_harvest()` itself.
+- **Harvest triggers:** (a) `deposit()` auto-harvests (reverts if harvest fails); `withdraw()` attempts harvest when unpaused (proceeds regardless of harvest outcome), (b) public `harvest()` with configurable caller reward (default 0.5%, set via factory `callerRewardBps`), subject to per-vault harvest cooldown and public/keeper access policy
+- **Harvest reward policy:** caller reward is always paid to `rewardRecipient` (passed to `_harvestInternal()`). For public `harvest()` and `deposit()`, this is `msg.sender`. For `withdraw()`, this is the vault owner's address (passed through the self-call). No special-casing within `_harvestInternal()` itself.
 - **Sweep-all harvest model:** when harvest proceeds (i.e., VELO balance is at or above `minimumHarvestVelo`), it processes all VELO currently held by the vault (`balanceOf`), not just newly claimed rewards. Previously accumulated VELO from no-debt skips is included; below-threshold balances are intentionally deferred.
+- **Per-vault timing/access controls:** each vault supports a configurable harvest cooldown (`harvestCooldown`, default 0), a public harvest toggle (`publicHarvestEnabled`, default true), and an optional trusted-keeper mode (`trustedKeeperModeEnabled`, default false). These controls mitigate fee-drag/timing griefing while preserving permissionless operation by default.
+- **Owner below-minimum override:** vault owner can force a harvest attempt below `minimumHarvestVelo` through a dedicated owner-only entrypoint for small-vault/idle-balance cleanup.
 - **Protocol fee:** configurable by factory admin (e.g. 0.5-2%), paid in VELO before swap
 - **Slippage:** user-configurable per vault, default 0.5% (50 bps). `minOut` is computed from TWAP quotes (`IPool.quote()` route-walk), which significantly reduces same-block sandwichability vs spot-price `getAmountsOut`. Residual MEV/execution risk still exists in thin-liquidity or rapidly-moving markets. See Milestone 3.2 security considerations for details.
 - **No-debt / all-earmarked / preexisting alAsset edge cases:** if user has no Alchemix debt, or all debt is earmarked (`earmarked >= debt`), VELO rewards are claimed but NOT swapped; held in vault until repayable debt exists or user recovers them via `rescueToken()`. Additionally, if preexisting alAsset in the vault (from prior failed/partial burns) already covers unearmarked debt, the VELO-to-alAsset swap is skipped (saving swap fees/slippage) and the preexisting alAsset is burned directly.
@@ -26,8 +28,8 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **Rescue function:** owner can rescue tokens when `deposits[token] == 0`; if `deposits[token] > 0`, rescue is blocked as active LP principal (`CannotRescueActiveLp`)
 - **Admin role:** Ownable2Step with pause capability; admin can update implementation (for future clones), set fees, pause. All admin config changes (chainConfig, implementation, treasury) take effect immediately with no timelock in v1. A compromised admin could redirect swaps or burn targets. Transition to pause-only or timelock-gated governance by transferring ownership to a restricted contract later.
 - **Fee-on-transfer LP tokens are not supported.** The vault uses `amount` as both the transfer input and the deposited amount. If an LP token charges a transfer fee, internal accounting will be incorrect.
-- **Withdraw harvest resilience (self-call pattern):** `withdraw()` attempts harvest via an external self-call: `try this._harvestForWithdraw(msg.sender) { ... } catch { emit HarvestFailed(...); }`. The `_harvestForWithdraw(address rewardRecipient)` function is `external` (enabling try/catch, which only works on external calls), NOT `nonReentrant` (because `withdraw()` already holds the reentrancy lock), and guarded by `require(msg.sender == address(this))` to prevent arbitrary external callers. The `rewardRecipient` parameter passes the vault owner's address through to `_harvest()`, because `msg.sender` changes to `address(this)` in Solidity external self-calls. If harvest fails for any reason (broken route, external revert, etc.), the catch block ensures withdrawal proceeds anyway. When paused, `withdraw()` skips harvest entirely (no self-call). `deposit()` calls `_harvest(msg.sender)` directly without resilience -- deposit is intentionally allowed to fail if the harvest path is broken (see "Deposit harvest dependency" below). This guarantees users can always exit regardless of harvest path health.
-- **Deposit harvest dependency:** `deposit()` calls `_harvest(msg.sender)` directly (not via the resilient self-call path). If the harvest path is broken (bad swap route, router failure, etc.), deposits with existing LP positions will revert. This is a conscious design choice: deposits are a non-emergency operation, and the owner can fix the route/config or use `setSwapRoute()` before depositing more. In contrast, `withdraw()` is always resilient.
+- **Withdraw harvest resilience (self-call pattern):** `withdraw()` attempts harvest via an external self-call: `try this._harvestForWithdraw(msg.sender) { ... } catch { emit HarvestFailed(...); }`. The `_harvestForWithdraw(address rewardRecipient)` function is `external` (enabling try/catch, which only works on external calls), NOT `nonReentrant` (because `withdraw()` already holds the reentrancy lock), and guarded by `require(msg.sender == address(this))` to prevent arbitrary external callers. The `rewardRecipient` parameter passes the vault owner's address through to `_harvestInternal()`, because `msg.sender` changes to `address(this)` in Solidity external self-calls. If harvest fails for any reason (broken route, external revert, etc.), the catch block ensures withdrawal proceeds anyway. When paused, `withdraw()` skips harvest entirely (no self-call). `deposit()` calls `_harvestInternal(msg.sender, false)` directly without resilience -- deposit is intentionally allowed to fail if the harvest path is broken (see "Deposit harvest dependency" below). This guarantees users can always exit regardless of harvest path health.
+- **Deposit harvest dependency:** `deposit()` calls `_harvestInternal(msg.sender, false)` directly (not via the resilient self-call path). If the harvest path is broken (bad swap route, router failure, etc.), deposits with existing LP positions will revert. This is a conscious design choice: deposits are a non-emergency operation, and the owner can fix the route/config or use `setSwapRoute()` before depositing more. In contrast, `withdraw()` is always resilient.
 - **Gauge compatibility requirement:** supported deployments must use gauge implementations compatible with `IGauge` as defined in this project. Gauges with multiple reward tokens or non-VELO rewards are incompatible and unsupported. This is a deployment prerequisite, not merely an assumption.
 - **Killed-gauge withdrawal prerequisite (production gate):** the invariant "users can always withdraw LP principal" is production-safe only after confirming on target Velodrome deployment that `gauge.withdraw()` continues to work for killed gauges. Until verified, this remains the most important external protocol assumption.
 - **Approval strategy:** all token approvals use `forceApprove` (OZ v5) to handle tokens that require approve-to-zero before setting a new allowance. Explicit zeroing is performed on successful execution paths; revert paths rely on transaction atomicity rollback. This is the single canonical approval pattern used throughout.
@@ -52,7 +54,7 @@ sequenceDiagram
     Factory->>Vault: initialize(owner, factory, config)
 
     User->>Vault: deposit(lpToken, amount)
-    Vault->>Vault: _harvest(msg.sender) [auto on deposit, direct call]
+    Vault->>Vault: _harvestInternal(msg.sender, false) [auto on deposit, direct call]
     Vault->>Gauge: deposit(amount)
 
     Note over Vault: Time passes, VELO accrues
@@ -271,6 +273,7 @@ library DataTypes {
     uint256 constant MAX_TOTAL_FEE_BPS = 500;    // 5% combined max (protocolFee + callerReward)
     uint256 constant DEFAULT_MINIMUM_HARVEST_VELO = 1e15; // ~0.001 VELO — default threshold calibrated for Optimism gas costs
     uint256 constant MAX_MINIMUM_HARVEST_VELO = 1e18;    // 1 VELO — upper bound prevents admin from setting an unreasonably high threshold that blocks all harvests
+    uint256 constant MAX_HARVEST_COOLDOWN = 7 days;      // upper bound for per-vault cooldown to prevent owner misconfiguration
     uint256 constant MAX_ROUTE_LENGTH = 5;        // maximum swap route hops — prevents excessive gas and block gas limit issues
 }
 ```
@@ -417,6 +420,7 @@ interface IVeloHarvestVault {
 
     // --- Harvest (public) ---
     function harvest() external returns (uint256 veloHarvested);
+    function harvestBelowMinimum() external returns (uint256 veloHarvested);
 
     // --- Token retrieval (onlyOwner) ---
     function rescueToken(address token, uint256 amount) external;
@@ -425,6 +429,10 @@ interface IVeloHarvestVault {
     function setAlchemixPositionId(uint256 newId) external;
     function setSlippageTolerance(uint256 newBps) external;
     function setSwapRoute(IRouter.Route[] calldata newRoute) external;
+    function setHarvestCooldown(uint256 newCooldown) external;
+    function setPublicHarvestEnabled(bool enabled) external;
+    function setTrustedKeeperModeEnabled(bool enabled) external;
+    function setTrustedKeeper(address keeper, bool allowed) external;
 
     // --- Ownership transfer ---
     function transferOwnership(address newOwner) external;
@@ -443,6 +451,11 @@ interface IVeloHarvestVault {
     function getDepositedBalance(address lpToken) external view returns (uint256);
     function getPendingRewards(address lpToken) external view returns (uint256);
     function getTotalPendingRewards() external view returns (uint256);
+    function getHarvestCooldown() external view returns (uint256);
+    function getLastHarvestTimestamp() external view returns (uint256);
+    function isPublicHarvestEnabled() external view returns (bool);
+    function isTrustedKeeperModeEnabled() external view returns (bool);
+    function isTrustedKeeper(address keeper) external view returns (bool);
 }
 ```
 
@@ -461,12 +474,17 @@ interface IVeloHarvestVault {
   - `Deposited(address indexed lpToken, uint256 amount)`
   - `Withdrawn(address indexed lpToken, uint256 amount)`
   - `EmergencyWithdrawn(address indexed lpToken, uint256 amount)`
-  - `HarvestCompleted(uint256 veloTotal, uint256 callerReward, uint256 protocolFee, uint256 veloPostFees)` -- emitted after `_harvest()` completes claim/fee accounting for the call. This event can be emitted in the same transaction as `HarvestSkipped` when `_swapAndBurn()` intentionally skips swap/burn but `_harvest()` otherwise completes.
+  - `HarvestCompleted(uint256 veloTotal, uint256 callerReward, uint256 protocolFee, uint256 veloPostFees)` -- emitted after `_harvestInternal()` completes claim/fee accounting for the call. This event can be emitted in the same transaction as `HarvestSkipped` when `_swapAndBurn()` intentionally skips swap/burn but `_harvestInternal()` otherwise completes.
   - `SwappedAndBurned(uint256 veloPostFees, uint256 newlyReceived, uint256 actualBurned, uint256 alchemixPositionId)`
   - `BurnFailed(uint256 alAssetAmount, uint256 alchemixPositionId)`
   - `HarvestSkipped(uint256 veloAmount, string reason)` -- emitted when the swap/burn leg is intentionally skipped. `veloAmount` always reflects the actual VELO amount that was not swapped. This event intentionally covers both **economic skips** (e.g., "no debt", "all debt earmarked", "alchemist not set", "getCDP failed", "debt token mismatch", "below minimum") and **quote-path/route skips** (e.g., "twap quote failed", "twap quote returned zero"). It may co-exist with `HarvestCompleted` in the same call.
   - `HarvestFailed(string reason)` -- emitted in the `withdraw()` catch-path when the harvest self-call reverted entirely. The VELO amount is unknown because the failure occurred before or during the VELO balance check. This is distinct from `HarvestSkipped` (which has a known amount) to avoid ambiguity in off-chain monitoring. The withdrawal always proceeds after this event.
   - `GaugeSkipped(address indexed lpToken, address indexed gauge, string reason)`
+  - `HarvestCooldownUpdated(uint256 oldCooldown, uint256 newCooldown)`
+  - `PublicHarvestUpdated(bool oldEnabled, bool newEnabled)`
+  - `TrustedKeeperModeUpdated(bool oldEnabled, bool newEnabled)`
+  - `TrustedKeeperUpdated(address indexed keeper, bool allowed)`
+  - `HarvestBelowMinimumExecuted(address indexed owner, uint256 veloBalance)`
   - `TokenRescued(address indexed token, uint256 amount, address indexed to)`
   - `OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner)`
   - `OwnershipTransferred(address indexed previousOwner, address indexed newOwner)`
@@ -493,6 +511,9 @@ error VaultPaused();
 error OnlySelf();
 error InvalidPositionId();
 error MinimumHarvestVeloTooHigh();
+error UnauthorizedHarvester(address caller);
+error HarvestCooldownActive(uint256 nextAllowedTimestamp);
+error CooldownTooLong(uint256 provided, uint256 max);
 ```
 
 - [ ] Document pause semantics matrix:
@@ -518,22 +539,31 @@ Rationale: only state-expanding operations (new vaults, new deposits, reward pro
 
 - [ ] Document harvest reward policy:
 
-**Caller reward goes to `rewardRecipient`.** `_harvest(address rewardRecipient)` always transfers the caller reward to `rewardRecipient`. The callers set this as follows:
-- `harvest()` → `_harvest(msg.sender)` — public caller (keeper or owner) gets the reward
-- `deposit()` → `_harvest(msg.sender)` — owner gets the reward (since deposit is onlyOwner)
-- `_harvestForWithdraw(rewardRecipient)` → `_harvest(rewardRecipient)` — owner gets the reward (passed through from `withdraw()`'s `msg.sender`, because `msg.sender` changes to `address(this)` inside external self-calls)
+**Caller reward goes to `rewardRecipient`.** `_harvestInternal(address rewardRecipient, bool allowBelowMinimum)` always transfers the caller reward to `rewardRecipient`. The callers set this as follows:
+- `harvest()` → `_harvestInternal(msg.sender, false)` — public caller (keeper or owner) gets the reward
+- `deposit()` → `_harvestInternal(msg.sender, false)` — owner gets the reward (since deposit is onlyOwner)
+- `_harvestForWithdraw(rewardRecipient)` → `_harvestInternal(rewardRecipient, false)` — owner gets the reward (passed through from `withdraw()`'s `msg.sender`, because `msg.sender` changes to `address(this)` inside external self-calls)
+- `harvestBelowMinimum()` → `_harvestInternal(msg.sender, true)` — owner gets reward and can process below-threshold balance
 
 This is consistent: the vault owner always receives the caller reward when they trigger harvest, and third-party keepers receive it when calling the public `harvest()` function.
 
-**Permissionless harvest:** `harvest()` is callable by any address (no access restriction). The caller reward policy is identical regardless of whether the caller is the vault owner or a third-party keeper -- `_harvest(msg.sender)` is always used, and `msg.sender` receives the reward. There is no special-casing for owner vs. non-owner callers.
+**Permissionless harvest:** `harvest()` is callable by any address by default, with policy gates (`publicHarvestEnabled`, optional trusted-keeper mode, cooldown) controlled by the vault owner. The caller reward policy is identical regardless of whether the caller is the vault owner or a third-party keeper -- `_harvestInternal(msg.sender, false)` is always used, and `msg.sender` receives the reward. There is no special-casing for owner vs. non-owner callers.
+
+**Economic timing tradeoff + mitigation controls:** permissionless harvest intentionally gives up strict owner timing control once rewards accrue. To reduce economic griefing/fee-drag risk while preserving open-keeper UX, each vault includes:
+- `harvestCooldown` (owner-set minimum interval between successful harvests; default `0`)
+- `publicHarvestEnabled` (owner can disable permissionless harvest and keep owner-only harvest flow)
+- `trustedKeeperModeEnabled` + keeper allowlist (owner can restrict non-owner harvests to approved keeper addresses)
+- `harvestBelowMinimum()` owner-only override to process balances below `minimumHarvestVelo` when desired
+
+These controls apply to externally-triggered harvest entrypoints and do not weaken the `withdraw()` exit guarantee (withdraw still skips or best-effort-harvests per pause/resilience rules, then always proceeds).
 
 **Admin operations note (combined fee cap):** Because `protocolFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` is enforced in both `setProtocolFee()` and `setCallerReward()`, an admin must lower one fee before raising the other if the current combined total is at the cap. For example, if `protocolFeeBps = 500` (its individual maximum), any non-zero `callerRewardBps` will revert because `500 + n > 500`. The admin must first lower `protocolFeeBps`, then set `callerRewardBps`. This is by design (prevents accidental over-taxation) but should be documented in the admin operations guide to avoid wasted transactions.
 
 - [ ] Document sweep-all policy:
 
-**Harvest uses sweep-all model.** After claiming rewards from gauges, `_harvest()` reads `IERC20(veloToken).balanceOf(address(this))` and, when the balance is at or above `minimumHarvestVelo`, processes the entire VELO balance (including previously accumulated VELO from no-debt skips or prior partial operations). This is intentional: when debt later appears, accumulated VELO is processed in one sweep once the threshold is met. The user can call `rescueToken(veloToken, amount)` before a harvest to extract accumulated VELO if they want to prevent it from being swept.
+**Harvest uses sweep-all model.** After claiming rewards from gauges, `_harvestInternal()` reads `IERC20(veloToken).balanceOf(address(this))` and, when the balance is at or above `minimumHarvestVelo` (or when owner uses below-min override), processes the entire VELO balance (including previously accumulated VELO from no-debt skips or prior partial operations). This is intentional: when debt later appears, accumulated VELO is processed in one sweep once the threshold is met. The user can call `rescueToken(veloToken, amount)` before a harvest to extract accumulated VELO if they want to prevent it from being swept.
 
-**Sweep-all applies even when `activeLpTokens` is empty.** If the vault holds VELO but has no active LP positions (e.g., all LPs were withdrawn or emergency-withdrawn while VELO accumulated from prior no-debt skips), `_harvest()` still runs the sweep-all balance check and, if threshold is met, the fee/swap/burn logic. The gauge-claim loop simply has nothing to iterate. `_harvest()` returns 0 for both zero-balance and below-threshold cases (emitting `HarvestSkipped(..., "below minimum")`).
+**Sweep-all applies even when `activeLpTokens` is empty.** If the vault holds VELO but has no active LP positions (e.g., all LPs were withdrawn or emergency-withdrawn while VELO accumulated from prior no-debt skips), `_harvestInternal()` still runs the sweep-all balance check and, if threshold is met (or owner uses override), the fee/swap/burn logic. The gauge-claim loop simply has nothing to iterate. `_harvestInternal()` returns 0 for both zero-balance and below-threshold cases (emitting `HarvestSkipped(..., "below minimum")`) on the normal path.
 
 - [ ] Document swap route validation rules:
 
@@ -625,6 +655,11 @@ Implement the vault's initialization, ownership, and storage layout. The vault i
     - `address[] public activeLpTokens` — list of LP tokens currently staked
     - `mapping(address lpToken => uint256 amount) public deposits` — per-LP-token balance
     - `mapping(address lpToken => address gauge) public lpToGauge` — cached gauge lookup
+    - `uint256 public harvestCooldown` — owner-set minimum seconds between successful harvests (`0` disables cooldown)
+    - `uint256 public lastHarvestTimestamp` — timestamp of most recent successful harvest completion
+    - `bool public publicHarvestEnabled` — whether non-owner callers may use `harvest()` (default true)
+    - `bool public trustedKeeperModeEnabled` — whether non-owner harvest is restricted to owner-approved keepers (default false)
+    - `mapping(address keeper => bool allowed) public trustedKeepers` — per-vault keeper allowlist when trusted-keeper mode is enabled
   - **Constructor:** `constructor() { _disableInitializers(); }` — prevents implementation from being initialized directly
   - **`initialize()` function:**
     ```solidity
@@ -644,6 +679,7 @@ Implement the vault's initialization, ownership, and storage layout. The vault i
     - Call `__ReentrancyGuard_init()`
     - Store all parameters (factory stored as `IVeloHarvestFactory(_factory)`)
     - Copy swap route to storage
+    - Set defaults: `publicHarvestEnabled = true`, `trustedKeeperModeEnabled = false`, `harvestCooldown = 0`, `lastHarvestTimestamp = 0`
   - **Modifiers:**
     - `onlyOwner` — reverts with `NotOwner()` if `msg.sender != owner`
     - `whenNotPaused` — reads `paused()` from factory contract; reverts with `VaultPaused()` if true
@@ -651,6 +687,10 @@ Implement the vault's initialization, ownership, and storage layout. The vault i
     - `setAlchemixPositionId(uint256 newId) external onlyOwner` — validate `newId > 0` (revert `InvalidPositionId()`); emits `AlchemixPositionIdUpdated(oldId, newId)`
     - `setSlippageTolerance(uint256 newBps) external onlyOwner` — validate <= MAX_SLIPPAGE_BPS, revert `SlippageTooHigh` if invalid; emits `SlippageToleranceUpdated(oldBps, newBps)`
     - `setSwapRoute(IRouter.Route[] calldata newRoute) external onlyOwner` — hop-continuity validation per Milestone 0.4 rules: `route.length > 0`, `route.length <= MAX_ROUTE_LENGTH`, `route[0].from == veloToken`, `route[last].to == targetAlAsset`, and for each `i > 0`: `route[i].from == route[i-1].to`. When the target alAsset address is `address(0)` in the chain config, an empty route is accepted and the end-token check is skipped (see zero-target handling in Milestone 0.4). Reverts with `InvalidSwapRoute()` if any applicable check fails. Emits `SwapRouteUpdated()`.
+    - `setHarvestCooldown(uint256 newCooldown) external onlyOwner` — validate `newCooldown <= MAX_HARVEST_COOLDOWN` (revert `CooldownTooLong(newCooldown, MAX_HARVEST_COOLDOWN)`), set `harvestCooldown`, emit `HarvestCooldownUpdated(oldCooldown, newCooldown)`
+    - `setPublicHarvestEnabled(bool enabled) external onlyOwner` — toggles permissionless `harvest()`, emits `PublicHarvestUpdated(oldEnabled, enabled)`
+    - `setTrustedKeeperModeEnabled(bool enabled) external onlyOwner` — toggles keeper-allowlist restriction for non-owner callers, emits `TrustedKeeperModeUpdated(oldEnabled, enabled)`
+    - `setTrustedKeeper(address keeper, bool allowed) external onlyOwner` — validate `keeper != address(0)` (revert `ZeroAddress()`), update mapping, emit `TrustedKeeperUpdated(keeper, allowed)`
   - **Ownership transfer functions:**
     - `transferOwnership(address newOwner) external onlyOwner` — validates `newOwner != address(0)` (reverts `ZeroAddress()`); sets `pendingOwner = newOwner`, emits `OwnershipTransferStarted(owner, newOwner)`
     - `acceptOwnership() external` — requires `msg.sender == pendingOwner` (reverts `NotPendingOwner()`). Execution order: (1) `address previousOwner = owner`, (2) `owner = pendingOwner`, (3) `pendingOwner = address(0)`, (4) emit `OwnershipTransferred(previousOwner, owner)`
@@ -698,7 +738,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
   5. Look up gauge: `address gauge = IVoter(config.voter).gauges(lpToken)`
   6. Validate `gauge != address(0)` — revert with `GaugeNotFound(lpToken)`
   7. Validate `IVoter(config.voter).isAlive(gauge)` — revert with `GaugeNotAlive(lpToken)`
-  8. If this vault has existing deposits (any LP token), call `_harvest(msg.sender)` before modifying state
+  8. If this vault has existing deposits (any LP token), call `_checkHarvestAccess(msg.sender, false)` then `_harvestInternal(msg.sender, false)` before modifying state
   9. Transfer LP tokens from owner to vault: `IERC20(lpToken).safeTransferFrom(msg.sender, address(this), amount)`
   10. Approve gauge to spend LP tokens: `IERC20(lpToken).forceApprove(gauge, amount)`
   11. Stake in gauge: `IGauge(gauge).deposit(amount)`
@@ -709,7 +749,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
 
   **Note:** This implementation assumes no fee-on-transfer. `deposits[lpToken] += amount` uses the requested amount directly. Fee-on-transfer LP tokens are explicitly unsupported (see Milestone 0.4).
 
-  **Deposit harvest dependency:** Step 8 calls `_harvest(msg.sender)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvest()` reverts due to a broken swap route, router failure, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
+  **Deposit harvest dependency:** Step 8 calls `_harvestInternal(msg.sender, false)` directly (not via the resilient self-call path used by `withdraw()`). If `_harvestInternal()` reverts due to a broken swap route, router failure, policy gate, or other issue, the entire deposit transaction reverts. This is a conscious design choice: deposits are a non-emergency operation, and the owner has tools to fix the issue (`setSwapRoute()`, `setSlippageTolerance()`, harvest policy settings) before retrying. First-time deposits (no prior LP positions) skip harvest entirely and are unaffected. This asymmetry between deposit (not resilient) and withdraw (resilient) is intentional — exit paths must never be blocked, but entry paths can require a healthy harvest configuration.
 
 - [ ] Implement `withdraw(address lpToken, uint256 amount) external onlyOwner nonReentrant`:
 
@@ -899,6 +939,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
   - **Read functions (implementing `IVeloHarvestFactory`):**
     - `getUserVaults(address user) external view returns (address[] memory)`
     - `getVaultCount() external view returns (uint256)`
+    - `getMinimumHarvestVelo() external view returns (uint256)`
     - `getChainConfig() external view returns (DataTypes.ChainConfig memory)` — used by vaults to read global config. This is the canonical way vaults access chain config; they call `factory.getChainConfig()`, not the auto-generated struct getter.
     - `getProtocolFeeBps() external view returns (uint256)`
     - `getCallerRewardBps() external view returns (uint256)`
@@ -947,15 +988,33 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
 
 **Tasks**
 
-- [ ] Implement `harvest() external nonReentrant whenNotPaused returns (uint256 veloHarvested)`:
-  1. Call `_harvest(msg.sender)`
-  2. Return total VELO harvested
+- [ ] Implement harvest access helpers:
+  - `_checkHarvestAccess(address caller, bool isBelowMinimumOverride) internal view`:
+    - owner may always harvest (including below-min override path)
+    - if not owner and `publicHarvestEnabled == false`, revert `UnauthorizedHarvester(caller)`
+    - if not owner and `trustedKeeperModeEnabled == true` and `trustedKeepers[caller] == false`, revert `UnauthorizedHarvester(caller)`
+    - if not below-min override and `harvestCooldown > 0` and `block.timestamp < lastHarvestTimestamp + harvestCooldown`, revert `HarvestCooldownActive(lastHarvestTimestamp + harvestCooldown)`
+  - `_harvestInternal(address rewardRecipient, bool allowBelowMinimum) internal returns (uint256 veloHarvested)`:
+    - shared implementation used by `harvest()`, `deposit()`, `_harvestForWithdraw()`, and `harvestBelowMinimum()`
 
-- [ ] Implement `_harvest(address rewardRecipient) internal returns (uint256 veloHarvested)`:
+- [ ] Implement `harvest() external nonReentrant whenNotPaused returns (uint256 veloHarvested)`:
+  1. `_checkHarvestAccess(msg.sender, false)`
+  2. Call `_harvestInternal(msg.sender, false)`
+  3. Return total VELO harvested
+
+- [ ] Implement `harvestBelowMinimum() external onlyOwner nonReentrant whenNotPaused returns (uint256 veloHarvested)`:
+  1. `_checkHarvestAccess(msg.sender, true)` (owner path; cooldown bypass intentionally allowed)
+  2. Read current VELO balance for observability: `uint256 veloBalance = IERC20(config.veloToken).balanceOf(address(this))`
+  3. Call `_harvestInternal(msg.sender, true)` so below-threshold balances can still process
+  4. Emit `HarvestBelowMinimumExecuted(msg.sender, veloBalance)`
+  5. Return harvested amount
+
+- [ ] Implement `_harvestInternal(address rewardRecipient, bool allowBelowMinimum) internal returns (uint256 veloHarvested)`:
   The `rewardRecipient` parameter specifies who receives the caller reward. Callers pass:
-  - `harvest()` → `_harvest(msg.sender)` — public caller gets reward
-  - `deposit()` → `_harvest(msg.sender)` — owner gets reward (msg.sender == owner due to onlyOwner)
-  - `_harvestForWithdraw(rewardRecipient)` → `_harvest(rewardRecipient)` — owner gets reward (passed through from withdraw's msg.sender)
+  - `harvest()` → `_harvestInternal(msg.sender, false)` — public caller gets reward
+  - `deposit()` → `_harvestInternal(msg.sender, false)` — owner gets reward (msg.sender == owner due to onlyOwner)
+  - `_harvestForWithdraw(rewardRecipient)` → `_harvestInternal(rewardRecipient, false)` — owner gets reward (passed through from withdraw's msg.sender)
+  - `harvestBelowMinimum()` → `_harvestInternal(msg.sender, true)` — owner gets reward and may process below-threshold balance
   1. If `activeLpTokens.length > 0`, claim VELO from each active gauge, skipping dead gauges:
      ```solidity
      DataTypes.ChainConfig memory config = factory.getChainConfig();
@@ -981,7 +1040,10 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   2. Get total VELO balance (sweep-all model): `uint256 veloBalance = IERC20(config.veloToken).balanceOf(address(this))`
 
      This captures the vault's entire VELO balance, including any previously accumulated VELO from earlier no-debt/skip scenarios. This is the intended "sweep-all" model (see Milestone 0.4). Users who want to extract accumulated VELO before it gets processed should call `rescueToken(veloToken, amount)` first. This balance check runs even when there are no active LPs, ensuring previously accumulated VELO gets processed.
-  3. If `veloBalance < factory.getMinimumHarvestVelo()`, emit `HarvestSkipped(veloBalance, "below minimum")` and return 0. This covers both the zero-VELO case (providing observability for a previously silent path) and the micro-balance case (preventing router reverts from tiny swap amounts). The threshold is a factory-configurable parameter (default `DEFAULT_MINIMUM_HARVEST_VELO = 1e15`, ~0.001 VELO) to allow per-deployment tuning for chains with different gas economics.
+  3. If `veloBalance < factory.getMinimumHarvestVelo()`:
+     - if `allowBelowMinimum == false`: emit `HarvestSkipped(veloBalance, "below minimum")` and return 0
+     - if `allowBelowMinimum == true`: continue (owner override path)
+     This covers both the zero-VELO case (providing observability for a previously silent path) and the micro-balance case (preventing router reverts from tiny swap amounts) for the normal path. The threshold is a factory-configurable parameter (default `DEFAULT_MINIMUM_HARVEST_VELO = 1e15`, ~0.001 VELO) to allow per-deployment tuning for chains with different gas economics.
   4. Read fee config from factory: `uint256 callerRewardBps = factory.getCallerRewardBps()`
   5. Read fee config from factory: `uint256 protocolFeeBps = factory.getProtocolFeeBps()`
   6. Calculate caller reward: `uint256 callerReward = (veloBalance * callerRewardBps) / MAX_BPS`
@@ -991,38 +1053,40 @@ Implement the core harvest flow: claim VELO rewards from all active gauges, dedu
   10. Remaining VELO: `uint256 remaining = veloBalance - callerReward - protocolFee`
   11. Call `_swapAndBurn(remaining)` (next milestone)
   12. Emit `HarvestCompleted(veloBalance, callerReward, protocolFee, remaining)`
-  13. Return `veloBalance`
+  13. Set `lastHarvestTimestamp = block.timestamp` on successful completion
+  14. Return `veloBalance`
 
   **Implementation polish (gas/clarity):** although direct factory reads in steps 3-5/9 are acceptable, implementations should locally cache frequently used values (`minimumHarvestVelo`, `callerRewardBps`, `protocolFeeBps`, `treasury`) to reduce repeated external calls and keep style consistent with existing config-caching guidance.
 
-  **Event semantics note:** `_swapAndBurn(remaining)` may emit `HarvestSkipped(...)` and return for an intentional skip reason (e.g., no debt, quote failure), after which `_harvest()` still emits `HarvestCompleted(...)`. Off-chain monitoring should interpret this as "harvest pipeline completed, swap/burn leg skipped," not as a contradiction.
+  **Event semantics note:** `_swapAndBurn(remaining)` may emit `HarvestSkipped(...)` and return for an intentional skip reason (e.g., no debt, quote failure), after which `_harvestInternal()` still emits `HarvestCompleted(...)`. Off-chain monitoring should interpret this as "harvest pipeline completed, swap/burn leg skipped," not as a contradiction.
 
 - [ ] Implement `_harvestForWithdraw(address rewardRecipient) external`:
   This is the **self-call wrapper** that enables `withdraw()` to use `try/catch` around harvest logic. Solidity `try/catch` only works on external calls, so this external function exists solely to bridge that gap.
   ```solidity
   function _harvestForWithdraw(address rewardRecipient) external {
       if (msg.sender != address(this)) revert OnlySelf();
-      _harvest(rewardRecipient);
+    _checkHarvestAccess(rewardRecipient, false);
+    _harvestInternal(rewardRecipient, false);
   }
   ```
   **Critical design constraints:**
   - `external` — required so `withdraw()` can call `try this._harvestForWithdraw(msg.sender)`
   - **NOT `nonReentrant`** — `withdraw()` already holds the reentrancy lock; applying `nonReentrant` here would cause the self-call to revert
   - `msg.sender == address(this)` guard — prevents arbitrary external callers from invoking this function. The only legitimate caller is the contract itself via the self-call in `withdraw()`
-  - **`rewardRecipient` parameter** — when `withdraw()` does `this._harvestForWithdraw(msg.sender)`, `msg.sender` inside the external call becomes `address(this)` (Solidity external self-call semantics). The `rewardRecipient` parameter passes the original caller's address through so `_harvest()` sends the caller reward to the vault owner, not to the contract itself.
+- **`rewardRecipient` parameter** — when `withdraw()` does `this._harvestForWithdraw(msg.sender)`, `msg.sender` inside the external call becomes `address(this)` (Solidity external self-call semantics). The `rewardRecipient` parameter passes the original caller's address through so `_harvestInternal()` sends the caller reward to the vault owner, not to the contract itself.
   - This function is NOT part of the `IVeloHarvestVault` interface. It is an implementation detail, not a public API surface. External tooling should not call it. It is implemented on the concrete `VeloHarvestVault` contract only and is invoked via `this._harvestForWithdraw(...)` from within the implementation; the Solidity `this.` syntax routes through the contract's own external dispatch, which works regardless of interface membership. Despite being excluded from the interface, `_harvestForWithdraw()` must have full NatSpec documentation (purpose, parameters, security rationale, and reentrancy note) for audit readability and internal tooling. **ABI visibility note:** Because this function is `external`, it appears in the contract's ABI and will be visible on block explorers. The `OnlySelf` guard prevents external callers from invoking it. NatSpec should clearly state that integrators and block explorer users should ignore this function — it is an internal implementation detail exposed only to satisfy Solidity's `try/catch` requirement.
-  - `deposit()` does NOT use this wrapper. It calls `_harvest(msg.sender)` directly (internal call). If harvest fails during deposit, the deposit reverts — this is intentional (see "Deposit harvest dependency" in architectural decisions).
+- `deposit()` does NOT use this wrapper. It calls `_harvestInternal(msg.sender, false)` directly (internal call). If harvest fails during deposit, the deposit reverts — this is intentional (see "Deposit harvest dependency" in architectural decisions).
 
 **Harvest reward policy:** Caller reward is always paid to `rewardRecipient`, which is:
-- `msg.sender` when called via public `harvest()` or `deposit()` (external caller or vault owner)
+- `msg.sender` when called via public `harvest()`, `harvestBelowMinimum()`, or `deposit()` (external caller or vault owner)
 - The vault owner's address (passed through from `withdraw()`'s `msg.sender`) when called via `_harvestForWithdraw()`
 
 This ensures consistent behavior: the vault owner always receives the caller reward when they trigger harvest (directly or via deposit/withdraw), and third-party keepers receive it when calling `harvest()`. See Milestone 0.4 for the full policy statement.
 
 **Security considerations**
 
-- Reentrancy guard (the public `harvest()` is nonReentrant; internal `_harvest()` is called from already-guarded functions)
-- **Self-call pattern for withdraw resilience:** `_harvestForWithdraw(address rewardRecipient)` is external but NOT nonReentrant. It is guarded only by `msg.sender == address(this)`. This is safe because the only entry point is `withdraw()`, which is `nonReentrant`. The `rewardRecipient` parameter explicitly passes the vault owner's address to `_harvest()` for the caller reward, because `msg.sender` becomes `address(this)` inside external self-calls.
+- Reentrancy guard (public `harvest()` and `harvestBelowMinimum()` are nonReentrant; `_harvestInternal()` is called from already-guarded functions)
+- **Self-call pattern for withdraw resilience:** `_harvestForWithdraw(address rewardRecipient)` is external but NOT nonReentrant. It is guarded only by `msg.sender == address(this)`. This is safe because the only entry point is `withdraw()`, which is `nonReentrant`. The `rewardRecipient` parameter explicitly passes the vault owner's address to `_harvestInternal()` for the caller reward, because `msg.sender` becomes `address(this)` inside external self-calls.
 - SafeERC20 for all transfers
 - Fee calculation uses integer division (rounds down, safe)
 - If total fees exceed VELO balance due to rounding, use `min(fee, remaining)` pattern
@@ -1031,10 +1095,11 @@ This ensures consistent behavior: the vault owner always receives the caller rew
 
 - [ ] Harvest with no active LPs and no VELO returns 0, emits `HarvestSkipped(0, "below minimum")`
 - [ ] Harvest with VELO below `factory.getMinimumHarvestVelo()` returns 0, emits `HarvestSkipped(veloBalance, "below minimum")`
+- [ ] `harvestBelowMinimum()` (owner) processes below-threshold VELO and emits `HarvestBelowMinimumExecuted`
 - [ ] Admin can update `minimumHarvestVelo` via `setMinimumHarvestVelo()`; harvest respects updated threshold
 - [ ] `setMinimumHarvestVelo` reverts when `newMin > MAX_MINIMUM_HARVEST_VELO`
 - [ ] Harvest with no active LPs but VELO in vault: sweep-all processes accumulated VELO
-- [ ] Co-emission semantics: for intentional skip paths inside `_swapAndBurn()` (e.g., no debt or TWAP quote failure), `HarvestSkipped(...)` may be emitted and `HarvestCompleted(...)` is still emitted by `_harvest()` in the same call
+- [ ] Co-emission semantics: for intentional skip paths inside `_swapAndBurn()` (e.g., no debt or TWAP quote failure), `HarvestSkipped(...)` may be emitted and `HarvestCompleted(...)` is still emitted by `_harvestInternal()` in the same call
 - [ ] Harvest claims from all active (alive) gauges
 - [ ] Dead gauge is skipped during harvest (no revert, `GaugeSkipped` event emitted with "gauge not alive")
 - [ ] Alive gauge with reverting `getReward()` is skipped (no revert, `GaugeSkipped` event emitted with "getReward failed", other gauges still process)
@@ -1042,6 +1107,11 @@ This ensures consistent behavior: the vault owner always receives the caller rew
 - [ ] Protocol fee is correctly calculated and sent to treasury
 - [ ] Owner calling harvest receives caller reward (same policy as third party)
 - [ ] Public caller gets reward
+- [ ] Cooldown enforced for normal `harvest()` entrypoint (owner and non-owner); reverts with `HarvestCooldownActive` when called too early
+- [ ] Owner `harvestBelowMinimum()` bypasses threshold/cooldown gates by design
+- [ ] `publicHarvestEnabled == false`: non-owner `harvest()` reverts with `UnauthorizedHarvester`; owner still succeeds
+- [ ] `trustedKeeperModeEnabled == true`: only owner + allowlisted keepers may call `harvest()`
+- [ ] `setTrustedKeeper(address(0), allowed)` reverts with `ZeroAddress()`
 - [ ] Harvest with 0 pending rewards returns 0
 - [ ] Sweep-all: preexisting VELO in vault is included in harvest processing
 
@@ -1320,6 +1390,11 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
   - **Emergency withdraw all:** `emergencyWithdrawAll()` array mutation correctness (no skipped entries via while-loop)
   - **Harvest:** claims from all gauges, fee distribution, caller reward, owner self-harvest
   - **Harvest -- owner vs third-party:** owner harvest and third-party harvest both pay caller reward to `msg.sender` (same policy, different sender)
+  - **Harvest access policy:** `publicHarvestEnabled` false blocks non-owner harvest; trusted-keeper mode allows only owner + allowlisted keepers
+  - **Harvest cooldown:** normal `harvest()` reverts before cooldown expiry; succeeds after expiry
+  - **Owner below-min override:** `harvestBelowMinimum()` succeeds below threshold and bypasses cooldown by design
+  - **Donation effects:** third-party donated VELO participates in sweep-all and fee/reward accounting; third-party donated alAsset can trigger swap-skip and still be burned
+  - **Fee-drag comparison:** repeated threshold-crossing harvests vs one larger harvest show expected cumulative fee drag
   - **Harvest -- dead gauge:** dead gauge is skipped during harvest (no revert, `GaugeSkipped` event emitted with "gauge not alive", LP still withdrawable)
   - **Harvest -- alive gauge getReward revert:** alive gauge whose `getReward()` reverts is skipped (no revert, `GaugeSkipped` event emitted with "getReward failed", other gauges still process, LP still withdrawable)
   - **Harvest -- sweep-all:** preexisting VELO in vault before new harvest is included in processing
@@ -1396,6 +1471,7 @@ Fork tests against live Optimism state to validate integration with real Velodro
   - **TWAP granularity support:** Verify configured `TWAP_POINTS` is accepted by target pools and does not revert for intended routes
   - **Low-observation/new-pool behavior:** Verify expected skip behavior when pools have insufficient observations (`HarvestSkipped(veloAmount, "twap quote failed")`) and when quote-walk produces zero output (`HarvestSkipped(veloAmount, "twap quote returned zero")`)
   - **Multiple LP tokens:** Deposit into 2-3 different gauges, harvest from all
+  - **Economic behavior sanity:** validate keeper-triggered harvest timing + cooldown enforcement on real pools; confirm below-min balances remain deferred until threshold or owner override
   - **Emergency withdraw:** Works with real gauge contracts
 
 - [ ] Document real Optimism addresses used in fork tests:
@@ -1584,7 +1660,7 @@ Systematic security review and hardening of all contracts before deployment.
 
 **Tasks**
 
-- [ ] **Reentrancy:** Verify `nonReentrant` on all external state-changing functions. Verify check-effects-interactions pattern. **Self-call exception:** verify `_harvestForWithdraw(address rewardRecipient)` is `external` but NOT `nonReentrant`, and is guarded only by `require(msg.sender == address(this), OnlySelf())`. Verify this is safe: the only caller is `withdraw()` which already holds the reentrancy lock. Verify that `rewardRecipient` is used (not `msg.sender`) inside `_harvest()` for the caller reward, because `msg.sender` becomes `address(this)` in external self-calls. Verify `withdraw()` passes its own `msg.sender` (the vault owner) as `rewardRecipient`.
+- [ ] **Reentrancy:** Verify `nonReentrant` on all external state-changing functions. Verify check-effects-interactions pattern. **Self-call exception:** verify `_harvestForWithdraw(address rewardRecipient)` is `external` but NOT `nonReentrant`, and is guarded only by `require(msg.sender == address(this), OnlySelf())`. Verify this is safe: the only caller is `withdraw()` which already holds the reentrancy lock. Verify that `rewardRecipient` is used (not `msg.sender`) inside `_harvestInternal()` for the caller reward, because `msg.sender` becomes `address(this)` in external self-calls. Verify `withdraw()` passes its own `msg.sender` (the vault owner) as `rewardRecipient`.
 - [ ] **Access control:** Verify `onlyOwner` on all restricted functions. Verify no unprotected state changes. Verify two-step ownership transfer (`transferOwnership` / `acceptOwnership`) is correctly implemented.
 - [ ] **Integer overflow/underflow:** Solidity 0.8+ handles this, but verify no unchecked blocks have issues.
 - [ ] **Token handling:** SafeERC20 everywhere. Handle tokens that don't return bool. Fee-on-transfer LP tokens are explicitly unsupported — verify this assumption is documented and no balance-delta is needed for standard LP tokens.
@@ -1603,9 +1679,19 @@ Systematic security review and hardening of all contracts before deployment.
   - **alAsset address change (operational risk):** If admin updates `config.alETH` or `config.alUSD` to a new address (e.g., V3 uses different alAsset than V2), existing vaults with swap routes ending in the old token address will fail at swap time. The `debtToken()` mismatch check catches some cases, but if both `alchemist.debtToken()` and `config.alETH` are updated consistently, the route's `_swapRoute[last].to` still points to the old token. Affected vault owners must manually call `setSwapRoute()` to update their route. This should be prominently documented in `SECURITY.md`, and the `ChainConfigUpdated` event provides sufficient data for tooling to detect and alert affected users.
   - **Gauge migration (latent risk):** If Velodrome migrates a gauge (creates a new gauge address for the same LP pool while deprecating the old one), `lpToGauge[lpToken]` is updated on the next deposit (step 14 always writes the voter-looked-up gauge). New deposits are staked in the new gauge and tracked correctly. However, prior deposits staked in the old gauge remain there — the vault has no mechanism to migrate staked LP tokens between gauges. Users with deposits in a deprecated gauge should `emergencyWithdraw` those tokens and re-deposit to stake in the new gauge. Gauge migration is rare in practice but this operational procedure should be documented in the user guide.
 
-- [ ] **Withdraw exitability guarantee:** Verify that `withdraw()` never reverts due to harvest path failures. The self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`) must catch all possible revert paths including router failures, alchemist failures, gauge getReward failures, and unexpected external reverts. Verify that `_harvestForWithdraw(address rewardRecipient)` is external (required for try/catch) and NOT nonReentrant (would fail since withdraw already holds the lock). Verify `rewardRecipient` is correctly passed through to `_harvest()`. When factory is paused, verify harvest is skipped entirely within `withdraw()` (no self-call). This invariant is operationally subject to the killed-gauge prerequisite (`gauge.withdraw()` must remain callable for killed gauges).
+- [ ] **Withdraw exitability guarantee:** Verify that `withdraw()` never reverts due to harvest path failures. The self-call pattern (`try this._harvestForWithdraw(msg.sender) catch`) must catch all possible revert paths including router failures, alchemist failures, gauge getReward failures, and unexpected external reverts. Verify that `_harvestForWithdraw(address rewardRecipient)` is external (required for try/catch) and NOT nonReentrant (would fail since withdraw already holds the lock). Verify `rewardRecipient` is correctly passed through to `_harvestInternal()`. When factory is paused, verify harvest is skipped entirely within `withdraw()` (no self-call). This invariant is operationally subject to the killed-gauge prerequisite (`gauge.withdraw()` must remain callable for killed gauges).
 
 - [ ] **Trust model documentation:** Factory admin is a trusted role with the power to redirect swap/burn endpoints and thereby influence future harvest behavior of all vaults. Admin config changes (chainConfig, implementation, treasury) take immediate effect with no timelock. A compromised admin could redirect swaps to an attacker-controlled router or burn targets to a different alchemist. Users should verify admin identity before depositing. Users retain LP withdrawal control against admin misuse, with the separate external caveat that killed-gauge withdrawal behavior must be verified on the target Velodrome deployment. Every admin config change emits an event (including security-critical address fields in `ChainConfigUpdated`) for off-chain monitoring. The intended long-term path is transition to a pause-only role, multisig, or timelock-gated governance contract. A timelock is recommended for future governance upgrades. Document these trust assumptions in `docs/SECURITY.md`. Also document the **residual MEV risk** even with TWAP-based `minOut`: TWAP significantly reduces same-block sandwichability vs spot `getAmountsOut`, but does not guarantee best execution and remains sensitive to liquidity and price moves between observations and execution.
+
+- [ ] **Economic / Game-Theoretic Risks:** Add a dedicated section in `docs/SECURITY.md` and mirror key points in README:
+  - Permissionless harvest gives up strict owner timing control; third parties can choose when execution occurs once harvest conditions are met.
+  - Repeated small harvests can increase aggregate fee drag (caller reward + protocol fee) versus fewer larger harvests.
+  - TWAP `minOut` is a manipulation-resistance anchor, not a best-execution guarantee; thin liquidity and volatility still matter.
+  - Below-threshold VELO can remain idle for long periods; this is expected unless owner uses `harvestBelowMinimum()` or `rescueToken()`.
+  - Donated VELO/alAsset balances are source-agnostic and affect sweep-all/burn behavior.
+  - Admin compromise remains the largest catastrophic risk because config changes are immediate in v1.
+  - Gauge migration/killed-gauge behavior are external dependencies with user-value impact.
+  - Mitigation controls required in v1 spec: per-vault cooldown, public-harvest toggle, trusted-keeper mode, and owner-only below-min override.
 
 - [ ] **Rescue function verification:** Verify `rescueToken()` correctly prevents rescue of actively staked LP tokens by checking `deposits[token] > 0` (reverts with `CannotRescueActiveLp`). Verify the simplified check is sufficient: `deposits` and `activeLpTokens` are always kept in sync, so checking the mapping alone is deterministic and gas-cheap. Verify the invariant: users can recover any ERC-20 sent to their vault (including VELO, alAsset, and accidental transfers) via `rescueToken()`, except tokens that are actively staked as LP principal. Actively staked LP tokens are recoverable via `withdraw()` or `emergencyWithdraw()`.
 
@@ -1696,9 +1782,9 @@ Comprehensive README and supporting documentation for the project.
   2. User calls `createVault()` on the factory (could be via Etherscan or a future user UI)
   3. User approves LP tokens and calls `deposit()`
   4. Rewards accrue and are harvested automatically: on every deposit (required) and on withdraw when unpaused (best-effort -- withdrawal always succeeds even if harvest fails)
-  5. Third parties or bots call `harvest()` to earn the 0.5% VELO reward (permissionless -- reward behavior is identical whether called by the owner or a third party)
+  5. Third parties or bots can call `harvest()` to earn the caller reward sent to `rewardRecipient` (default 0.5% via factory `callerRewardBps`, configurable); owner may restrict this via per-vault `publicHarvestEnabled`, trusted-keeper mode, and cooldown settings
   6. User can call `emergencyWithdraw()` at any time
-  7. Owner may recover accumulated VELO or alAsset from the vault via `rescueToken()` at any time, including while the factory is paused; doing so reduces future auto-repayment (see trust model)
+  7. For small/idle balances below `minimumHarvestVelo`, owner can either call `harvestBelowMinimum()` (force processing) or recover via `rescueToken()`; rescuing VELO/alAsset reduces future auto-repayment (see trust model)
   8. If Velodrome migrates an LP's gauge, new deposits update gauge tracking automatically, but existing stake is not auto-migrated; owner should manually withdraw/emergencyWithdraw and re-deposit to move stake to the new gauge
 
 **Done when**
@@ -1773,7 +1859,13 @@ Deploy the factory and implementation to Optimism mainnet.
 - [ ] Emergency withdraw transfers only gauge-withdrawn amount (extras via `rescueToken`)
 - [ ] `emergencyWithdrawAll` correctly processes all LP tokens (while-loop, no skipped entries)
 - [ ] Harvest claims from all alive gauges; dead gauges skipped with `GaugeSkipped` event
-- [ ] Caller reward (0.5% VELO) is paid to `rewardRecipient`: `msg.sender` for public `harvest()` and `deposit()`, vault owner (passed through self-call) for `withdraw()`
+- [ ] Caller reward (default 0.5% via configurable factory `callerRewardBps`) is paid to `rewardRecipient`: `msg.sender` for public `harvest()` and `deposit()`, vault owner (passed through self-call) for `withdraw()`
+- [ ] Public harvest toggle: non-owner harvest blocked when disabled; owner harvest remains available
+- [ ] Trusted-keeper mode: only owner + allowlisted keepers can harvest
+- [ ] Harvest cooldown: repeated calls within cooldown window revert; post-window calls succeed
+- [ ] Owner below-minimum override: `harvestBelowMinimum()` can process balances below `minimumHarvestVelo`
+- [ ] Donation economics: donated VELO/alAsset affect sweep-all and burn behavior as source-agnostic balances
+- [ ] Repeated-small-harvest scenario vs batched-harvest scenario demonstrates expected fee drag tradeoff
 - [ ] Protocol fee is paid to treasury
 - [ ] VELO is swapped to correct alAsset (alETH or alUSD)
 - [ ] Slippage protection works (reverts when slippage exceeded)
