@@ -5,7 +5,7 @@
 This project builds a **Solidity contract system** centered on two main contracts:
 
 1. **VeloHarvestFactory** — Deploys per-user vault clones (EIP-1167 minimal proxies), manages global configuration (chain addresses, protocol fee, caller reward), and serves as the admin-controlled registry.
-2. **VeloHarvestVault** (implementation) — Each user's clone accepts multiple Velodrome LP tokens, stakes them in the corresponding gauge contracts, claims VELO rewards, swaps VELO to alAsset (alETH or alUSD) via the Velodrome router, and calls `burn()` on the Alchemix v3 Alchemist contract to pay down the user's debt.
+2. **VeloHarvestVault** (implementation) — Each user's clone accepts multiple Velodrome LP tokens, stakes them in the corresponding gauge contracts, claims VELO rewards, executes VELO→alAsset swaps via the Velodrome router, and uses TWAP quote-walk guardrails (`IPool.quote()` with configured `poolFactory`) before calling `burn()` on the Alchemix v3 Alchemist to pay down the user's debt.
 
 A locally-hosted **React deployment UI** allows a deployer to fill in chain-specific contract addresses and deploy the factory to any EVM chain with a Velodrome-compatible DEX.
 
@@ -23,14 +23,14 @@ A locally-hosted **React deployment UI** allows a deployer to fill in chain-spec
 - **No-debt / all-earmarked / preexisting alAsset edge cases:** if user has no Alchemix debt, or all debt is earmarked (`earmarked >= debt`), VELO rewards are claimed but NOT swapped; held in vault until repayable debt exists or user recovers them via `rescueToken()`. Additionally, if preexisting alAsset in the vault (from prior failed/partial burns) already covers unearmarked debt, the VELO-to-alAsset swap is skipped (saving swap fees/slippage) and the preexisting alAsset is burned directly.
 - **Emergency withdraw:** unstakes and returns only gauge-withdrawn LP tokens immediately, skipping harvest; any directly donated LP tokens remain in the vault for `rescueToken()`
 - **Vault ownership transfer:** two-step transfer (`transferOwnership` + `acceptOwnership`), mirroring Ownable2Step pattern
-- **Rescue function:** owner can rescue any ERC-20 sent to the vault except actively staked LP principal
+- **Rescue function:** owner can rescue tokens when `deposits[token] == 0`; if `deposits[token] > 0`, rescue is blocked as active LP principal (`CannotRescueActiveLp`)
 - **Admin role:** Ownable2Step with pause capability; admin can update implementation (for future clones), set fees, pause. All admin config changes (chainConfig, implementation, treasury) take effect immediately with no timelock in v1. A compromised admin could redirect swaps or burn targets. Transition to pause-only or timelock-gated governance by transferring ownership to a restricted contract later.
 - **Fee-on-transfer LP tokens are not supported.** The vault uses `amount` as both the transfer input and the deposited amount. If an LP token charges a transfer fee, internal accounting will be incorrect.
 - **Withdraw harvest resilience (self-call pattern):** `withdraw()` attempts harvest via an external self-call: `try this._harvestForWithdraw(msg.sender) { ... } catch { emit HarvestFailed(...); }`. The `_harvestForWithdraw(address rewardRecipient)` function is `external` (enabling try/catch, which only works on external calls), NOT `nonReentrant` (because `withdraw()` already holds the reentrancy lock), and guarded by `require(msg.sender == address(this))` to prevent arbitrary external callers. The `rewardRecipient` parameter passes the vault owner's address through to `_harvest()`, because `msg.sender` changes to `address(this)` in Solidity external self-calls. If harvest fails for any reason (broken route, external revert, etc.), the catch block ensures withdrawal proceeds anyway. When paused, `withdraw()` skips harvest entirely (no self-call). `deposit()` calls `_harvest(msg.sender)` directly without resilience -- deposit is intentionally allowed to fail if the harvest path is broken (see "Deposit harvest dependency" below). This guarantees users can always exit regardless of harvest path health.
 - **Deposit harvest dependency:** `deposit()` calls `_harvest(msg.sender)` directly (not via the resilient self-call path). If the harvest path is broken (bad swap route, router failure, etc.), deposits with existing LP positions will revert. This is a conscious design choice: deposits are a non-emergency operation, and the owner can fix the route/config or use `setSwapRoute()` before depositing more. In contrast, `withdraw()` is always resilient.
 - **Gauge compatibility requirement:** supported deployments must use gauge implementations compatible with `IGauge` as defined in this project. Gauges with multiple reward tokens or non-VELO rewards are incompatible and unsupported. This is a deployment prerequisite, not merely an assumption.
 - **Killed-gauge withdrawal prerequisite (production gate):** the invariant "users can always withdraw LP principal" is production-safe only after confirming on target Velodrome deployment that `gauge.withdraw()` continues to work for killed gauges. Until verified, this remains the most important external protocol assumption.
-- **Approval strategy:** all token approvals use `forceApprove` (OZ v5) to handle tokens that require approve-to-zero before setting a new allowance. This is the single canonical approval pattern used throughout.
+- **Approval strategy:** all token approvals use `forceApprove` (OZ v5) to handle tokens that require approve-to-zero before setting a new allowance. Explicit zeroing is performed on successful execution paths; revert paths rely on transaction atomicity rollback. This is the single canonical approval pattern used throughout.
 - **Framework:** Foundry (forge/cast/anvil) — Solidity-native testing, built-in fork testing, modern standard
 - **Target:** Optimism first, chain-portable to Base (Aerodrome) and other Velodrome forks later
 - **Portability scope:** "Chain-portable" means deployable on any EVM chain with a Velodrome-compatible DEX that uses a single primary reward token distributed by gauges. The contract naming (`veloToken`, `HarvestCompleted`, etc.) reflects the Optimism-first design but the token address is configurable via `ChainConfig.veloToken`. Forks with fundamentally different gauge models (e.g., multiple reward tokens per gauge) are out of scope. See "Gauge compatibility requirement" below and in Milestone 0.4.
@@ -65,8 +65,9 @@ sequenceDiagram
     Note over Vault: Harvest flow (auto or public call)
     Vault->>Gauge: getReward(vault) [for each active gauge]
     Vault->>Vault: deduct callerReward + protocolFee in VELO
-    Vault->>Router: swapExactTokensForTokens(VELO -> alAsset)
-    Vault->>Alchemist: burn(alAssetAmount, positionId)
+    Note over Vault: If preexisting alAsset covers unearmarked debt, swap is skipped
+    Vault->>Router: swapExactTokensForTokens(VELO -> alAsset) [only when needed]
+    Vault->>Alchemist: burn(totalAlAssetBalanceAfterSwap, positionId)
 ```
 
 ### Contract Architecture
@@ -117,6 +118,7 @@ classDiagram
         +address veloToken
         +address router
         +address voter
+        +address poolFactory
         +address alETHAlchemist
         +address alUSDAlchemist
         +address alETH
@@ -449,7 +451,7 @@ interface IVeloHarvestVault {
 **Factory events:**
   - `VaultCreated(address indexed user, address indexed vault, DataTypes.AlAssetType alAssetType)`
   - `ImplementationUpdated(address indexed oldImpl, address indexed newImpl)`
-  - `ChainConfigUpdated(address oldRouter, address newRouter, address oldAlETHAlchemist, address newAlETHAlchemist, address oldAlUSDAlchemist, address newAlUSDAlchemist)` -- emits the security-critical address fields that affect vault harvest behavior. Monitors can see exactly which addresses changed without querying storage.
+  - `ChainConfigUpdated(address oldRouter, address newRouter, address oldPoolFactory, address newPoolFactory, address oldAlETHAlchemist, address newAlETHAlchemist, address oldAlUSDAlchemist, address newAlUSDAlchemist)` -- emits the security-critical address fields that affect vault harvest behavior (including TWAP quote-walk pool discovery via `poolFactory`). Monitors can see exactly which addresses changed without querying storage.
   - `ProtocolFeeUpdated(uint256 oldFee, uint256 newFee)`
   - `CallerRewardUpdated(uint256 oldReward, uint256 newReward)`
   - `MinimumHarvestVeloUpdated(uint256 oldMin, uint256 newMin)`
@@ -739,7 +741,7 @@ Implement LP token deposit (transferring tokens in, looking up the gauge from th
   2. Validate `amount > 0` (revert `ZeroAmount()` — prevents emitting a misleading zero-amount event when there are no deposits)
   3. Unstake all from gauge (no harvest): `IGauge(lpToGauge[lpToken]).withdraw(amount)`
   4. Transfer only the gauge-withdrawn amount to owner: `IERC20(lpToken).safeTransfer(owner(), amount)`
-  5. Update state: `deposits[lpToken] = 0`, remove from `activeLpTokens` via `_removeActiveLpToken`
+  5. Update state: `deposits[lpToken] = 0`, remove from `activeLpTokens` via `_removeActiveLpToken`, and `delete lpToGauge[lpToken]` so mappings/arrays remain in sync after emergency exit
   6. Emit `EmergencyWithdrawn(lpToken, amount)`
 
   **Note:** `_emergencyWithdrawSingle` transfers only the amount unstaked from the gauge, not the vault's entire LP token balance. If additional LP tokens were sent directly to the vault (e.g., accidental donations), they remain in the vault and are recoverable via `rescueToken()`. This provides cleaner accounting and avoids unintentionally sweeping donated tokens.
@@ -861,6 +863,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
       The five infrastructure addresses (`veloToken`, `router`, `voter`, `poolFactory`, `weth`) are required for basic vault operations (staking, reward claiming, swapping, and TWAP-based swap quoting). Alchemix-related addresses may be zero at deployment time — the vault gracefully skips swap/burn when `alchemist == address(0)`.
 
       **Deployment prerequisite (pool factory shape):** the configured `poolFactory` must be compatible with at least one selector used by the quote-walk (`getPair(tokenA, tokenB, stable)` or `getPool(tokenA, tokenB, stable)`). The dual-probe logic in `_swapAndBurn()` improves portability but does not eliminate the need to validate factory compatibility on the target chain via fork tests before deployment.
+      This prerequisite should be called out in constructor NatSpec/deployment notes so production deploys are blocked until selector compatibility is verified.
 
     - Validate `_implementation != address(0)`
     - Validate `_treasury != address(0)`
@@ -886,7 +889,7 @@ Implement the factory contract that deploys minimal proxy clones of the vault im
 
   - **Admin functions (onlyOwner):** Every setter emits an event with old and new values (see Milestone 0.4 event list):
     - `setImplementation(address newImpl)` — for future clones only; existing clones are unaffected. Emits `ImplementationUpdated(oldImpl, newImpl)`.
-    - `setChainConfig(DataTypes.ChainConfig calldata newConfig)` — update chain addresses (e.g. when Alchemix v3 deploys). Applies the same address validation rules as the constructor (see ChainConfig validation table above). Emits `ChainConfigUpdated(oldConfig.router, newConfig.router, oldConfig.alETHAlchemist, newConfig.alETHAlchemist, oldConfig.alUSDAlchemist, newConfig.alUSDAlchemist)` with the security-critical fields that affect vault behavior.
+    - `setChainConfig(DataTypes.ChainConfig calldata newConfig)` — update chain addresses (e.g. when Alchemix v3 deploys). Applies the same address validation rules as the constructor (see ChainConfig validation table above). Emits `ChainConfigUpdated(oldConfig.router, newConfig.router, oldConfig.poolFactory, newConfig.poolFactory, oldConfig.alETHAlchemist, newConfig.alETHAlchemist, oldConfig.alUSDAlchemist, newConfig.alUSDAlchemist)` with the security-critical fields that affect vault behavior.
     - `setProtocolFee(uint256 newFeeBps)` — validate `newFeeBps <= MAX_PROTOCOL_FEE_BPS` AND `newFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `ProtocolFeeUpdated(oldFee, newFee)`.
     - `setCallerReward(uint256 newRewardBps)` — validate `newRewardBps <= MAX_CALLER_REWARD_BPS` AND `protocolFeeBps + newRewardBps <= MAX_TOTAL_FEE_BPS` (revert `FeeTooHigh`). Emits `CallerRewardUpdated(oldReward, newReward)`.
     - `setMinimumHarvestVelo(uint256 newMin)` — validate `newMin <= MAX_MINIMUM_HARVEST_VELO` (revert `MinimumHarvestVeloTooHigh()`). Emits `MinimumHarvestVeloUpdated(oldMin, newMin)`. This allows per-deployment tuning of the harvest dust threshold for chains with different gas economics.
@@ -1172,6 +1175,7 @@ After claiming VELO and deducting fees, swap the remaining VELO to the configure
          newlyReceived = balanceAfterSwap - balanceBeforeSwap;
      }
      ```
+    On successful swap execution, router allowance is explicitly reset via `forceApprove(router, 0)`. If `swapExactTokensForTokens(...)` reverts, that explicit post-swap zeroing line is not reached; safety on that path relies on transaction atomicity (state/allowance changes in the reverted frame are rolled back).
   7. **Burn alAsset for debt repayment (total-balance burn):**
      ```solidity
      IERC20(alAssetToken).forceApprove(alchemist, balanceAfterSwap);
@@ -1355,7 +1359,7 @@ Comprehensive unit tests for both the vault and factory contracts using mock dep
   - **Combined fee cap:** `protocolFeeBps + callerRewardBps <= MAX_TOTAL_FEE_BPS` enforced in constructor, `setProtocolFee()`, and `setCallerReward()`; setting one fee to a value that would exceed the combined cap with the other fee reverts
   - **Combined fee cap admin ordering:** when `protocolFeeBps` is at `MAX_TOTAL_FEE_BPS`, setting any non-zero `callerRewardBps` reverts; lowering `protocolFeeBps` first, then setting `callerRewardBps` succeeds (verifies the documented admin workflow)
   - **Minimum harvest threshold:** `setMinimumHarvestVelo` validates `newMin <= MAX_MINIMUM_HARVEST_VELO`; harvest respects current factory value
-  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct router/alchemist address fields, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `MinimumHarvestVeloUpdated`, `TreasuryUpdated`)
+  - **Admin events:** all admin setters emit correct events with old/new values (`ImplementationUpdated`, `ChainConfigUpdated` with correct router/poolFactory/alchemist address fields, `ProtocolFeeUpdated`, `CallerRewardUpdated`, `MinimumHarvestVeloUpdated`, `TreasuryUpdated`)
   - **Access control:** non-owner reverts
   - **Ownable2Step:** two-step transfer works correctly
   - **Pause:** createVault reverts when paused
@@ -1674,7 +1678,7 @@ Comprehensive README and supporting documentation for the project.
   - Architecture diagram (Mermaid)
   - Prerequisites (Foundry, Node.js for deploy UI)
   - Quick start: build, test, deploy
-  - Chain-specific deployment guide (Optimism, Base)
+  - Chain-specific deployment guide (Optimism, Base), including `poolFactory` compatibility verification (`getPair` and/or `getPool`) and fork-test confirmation before production deployment
   - How to update Alchemist addresses when Alchemix v3 goes live
   - How to use the deploy UI
   - Security considerations
